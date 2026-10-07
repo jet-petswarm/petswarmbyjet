@@ -1,0 +1,2689 @@
+--[[
+    JET HUB - BETA
+    Record / Play macro hub with exact-cash system
+    - Cash is read from the real numeric value (leaderstats / attribute / value object)
+    - Cost of every place / upgrade is measured from the real cash drop
+    - Playback waits for the exact amount, verifies each purchase, and re-learns costs
+    v2 changes:
+    - Recorder hook no longer yields / clobbers the namecall method (fixes "can't place while recording")
+    - Fishing: pick the cast spot once (cast in-game), Auto Fish reuses it
+    - Macro tab: live step status while playing (วางตัว(...) / รอเงิน(...))
+    - Auto cost correction: +1 fast retry when the learned cost is too low, fixed value written back to the macro
+]]
+
+local TS=game:GetService("TweenService")
+local UIS=game:GetService("UserInputService")
+local RS=game:GetService("ReplicatedStorage")
+local HS=game:GetService("HttpService")
+local VU=game:GetService("VirtualUser")
+local RUN=game:GetService("RunService")
+local PLR=game:GetService("Players").LocalPlayer
+local PG=PLR:FindFirstChild("PlayerGui") or PLR:WaitForChild("PlayerGui")
+
+local HUB_NAME,HUB_TAG,HUB_FULL="JET HUB","BETA","JET HUB - BETA"
+
+-- global state (kept in one table to stay far away from the local-variable limit)
+local St={shut=false,playing=false,psess=0,fish=false,fsess=0,cur="Idle",visible=true,pick=false}
+local X={}      -- forward references (UI callbacks defined later)
+local Conns={}
+local function ac(c) Conns[#Conns+1]=c return c end
+local function cleanConns()
+    for _,c in ipairs(Conns) do pcall(function() c:Disconnect() end) end
+    Conns={}
+end
+
+local C={P=0,U=0,S=0}
+local rec={a={},n=1,t={},k={},l=0,active=false,finishing=false,pend={},hits=0}
+local passiveConns={}
+local knownTowers={}
+
+-- ============================ FILES / CONFIG ============================
+local FO="tdmacro/"
+local CF=FO.."config.json"
+pcall(function()
+    if type(isfolder)=="function" and type(makefolder)=="function" and not isfolder(FO) then
+        makefolder(FO)
+    end
+end)
+
+local function wj(p,d)
+    if type(writefile)~="function" then return false end
+    local ok,s=pcall(function() return HS:JSONEncode(d) end)
+    if not ok then return false end
+    return pcall(writefile,p,s)
+end
+local function rj(p)
+    if type(isfile)~="function" or type(readfile)~="function" then return nil end
+    local okf,ex=pcall(isfile,p)
+    if not okf or not ex then return nil end
+    local ok,d=pcall(readfile,p)
+    if not ok then return nil end
+    local ok2,a=pcall(function() return HS:JSONDecode(d) end)
+    if not ok2 or type(a)~="table" then return nil end
+    return a
+end
+local function lf()
+    if type(listfiles)~="function" then return {} end
+    local seen,n={},{}
+    for _,p in ipairs({FO,"tdmacro","./tdmacro/"}) do
+        local ok,list=pcall(listfiles,p)
+        if ok and type(list)=="table" then
+            for _,f in ipairs(list) do
+                local x=tostring(f):match("([^/\\]+)%.json$")
+                if x and x~="state" and x~="config" and not seen[x] then
+                    seen[x]=true
+                    n[#n+1]=x
+                end
+            end
+        end
+    end
+    table.sort(n,function(a,b) return a:lower()<b:lower() end)
+    return n
+end
+
+local function sanitizeAction(a)
+    if type(a)~="table" then return nil end
+    a.Method=nil a.method=nil a.bad=nil a._k=nil
+    local t=a.t
+    if t=="P" then
+        if type(a.n)~="string" or type(a.p)~="table" then return nil end
+        if type(a.p[1])~="number" or type(a.p[2])~="number" or type(a.p[3])~="number" then return nil end
+        if type(a.i)~="number" then return nil end
+    elseif t=="U" or t=="S" then
+        if type(a.i)~="number" then return nil end
+    elseif t~="W" and t~="G" then
+        return nil
+    end
+    return a
+end
+local function loadMacro(name)
+    if not name or name=="" then return nil end
+    local data=rj(FO..name..".json")
+    if type(data)~="table" then return nil end
+    local clean={}
+    for _,a in ipairs(data) do
+        local s=sanitizeAction(a)
+        if s then clean[#clean+1]=s end
+    end
+    return clean
+end
+
+local Cfg={}
+do
+    local c=rj(CF)
+    if type(c)=="table" then Cfg=c end
+end
+for k,v in pairs({
+    gs="1",mn="",sel="",sk=false,rp=false,lb=false,rec=false,pl=false,
+    s10=false,s1=false,s25=false,spn=false,afk=true,arc=true,oc=false,af=false,cm=true,
+    nw=true,lang="en",qmap="City",qauto=false,vmode="Easy",vauto=false,
+    crate="Free",acr=155,acg=120,acb=255,csrc="",uis=1,fpos=false
+}) do
+    if Cfg[k]==nil then Cfg[k]=v end
+end
+-- language: force English once (older builds could leave "th" saved), user choice is respected afterwards
+if Cfg.langv~=2 then Cfg.lang="en" Cfg.langv=2 end
+-- Anti AFK + Auto Reconnect are ON by default (forced on once for older configs)
+if Cfg.defv~=1 then Cfg.afk=true Cfg.arc=true Cfg.defv=1 end
+local _init=true
+local _pend=false
+local function save()
+    if St.shut then return end
+    if _init or _pend then return end
+    _pend=true
+    task.spawn(function()
+        task.wait(0.2)
+        _pend=false
+        if not St.shut then pcall(function() wj(CF,Cfg) end) end
+    end)
+end
+local function set(k,v)
+    if St.shut then return end
+    Cfg[k]=v
+    save()
+end
+
+-- ============================ THEME / UI HELPERS ============================
+local K={
+    bg=Color3.fromRGB(12,12,17),
+    side=Color3.fromRGB(16,16,22),
+    card=Color3.fromRGB(21,21,29),
+    el=Color3.fromRGB(29,29,40),
+    line=Color3.fromRGB(46,46,62),
+    tx=Color3.fromRGB(242,242,250),
+    sb=Color3.fromRGB(156,156,176),
+    mt=Color3.fromRGB(102,102,122),
+    off=Color3.fromRGB(50,50,66),
+    ok=Color3.fromRGB(86,208,140),
+    bad=Color3.fromRGB(240,98,98),
+    warn=Color3.fromRGB(242,192,84),
+    ac=Color3.fromRGB(tonumber(Cfg.acr) or 155,tonumber(Cfg.acg) or 120,tonumber(Cfg.acb) or 255),
+}
+local WHITE=Color3.new(1,1,1)
+
+local par
+pcall(function() if gethui then local h=gethui() if h then par=h end end end)
+par=par or game:GetService("CoreGui")
+for _,v in ipairs(par:GetChildren()) do
+    if v.Name=="JetHubUI" then pcall(function() v:Destroy() end) end
+end
+
+local function mk(c,p,r)
+    local o=Instance.new(c)
+    for k,v in next,p do o[k]=v end
+    if r then o.Parent=r end
+    return o
+end
+local sg=mk("ScreenGui",{Name="JetHubUI",IgnoreGuiInset=true,ResetOnSpawn=false,DisplayOrder=999,ZIndexBehavior=Enum.ZIndexBehavior.Sibling})
+pcall(function() if syn and syn.protect_gui then syn.protect_gui(sg) end end)
+sg.Parent=par
+
+local function corner(o,r) return mk("UICorner",{CornerRadius=UDim.new(0,r)},o) end
+local function stroke(o,c,t,tr)
+    return mk("UIStroke",{Color=c,Thickness=t or 1,Transparency=tr or 0,ApplyStrokeMode=Enum.ApplyStrokeMode.Border},o)
+end
+local function pad(o,l,t,r,b)
+    return mk("UIPadding",{PaddingLeft=UDim.new(0,l),PaddingTop=UDim.new(0,t or l),PaddingRight=UDim.new(0,r or l),PaddingBottom=UDim.new(0,b or t or l)},o)
+end
+local function vlist(o,gap)
+    return mk("UIListLayout",{SortOrder=Enum.SortOrder.LayoutOrder,Padding=UDim.new(0,gap or 8)},o)
+end
+local function T(p,text,size,col,font,props)
+    local o=mk("TextLabel",{
+        BackgroundTransparency=1,BorderSizePixel=0,Text=text,TextSize=size or 12,TextColor3=col or K.tx,
+        Font=font or Enum.Font.GothamMedium,TextXAlignment=Enum.TextXAlignment.Left,
+        TextYAlignment=Enum.TextYAlignment.Center,Size=UDim2.new(1,0,0,(size or 12)+4)
+    },p)
+    if props then for k,v in next,props do o[k]=v end end
+    return o
+end
+local function tw(o,t,p,style,dir)
+    if not o or not o.Parent then return end
+    pcall(function()
+        TS:Create(o,TweenInfo.new(t or 0.2,style or Enum.EasingStyle.Quart,dir or Enum.EasingDirection.Out),p):Play()
+    end)
+end
+
+-- objects whose colour follows the accent
+local themed={}
+local function th(o,prop,fn)
+    themed[#themed+1]={o=o,p=prop,f=fn}
+    pcall(function() o[prop]=fn and fn() or K.ac end)
+    return o
+end
+local function applyTheme(c,instant)
+    K.ac=c
+    for i=#themed,1,-1 do
+        local e=themed[i]
+        if not e.o or not e.o.Parent then
+            table.remove(themed,i)
+        else
+            local v=e.f and e.f() or c
+            if instant or typeof(v)=="ColorSequence" then
+                pcall(function() e.o[e.p]=v end)
+            else
+                tw(e.o,0.3,{[e.p]=v})
+            end
+        end
+    end
+end
+
+local function dragify(handle,target,onTap)
+    local dragging,moved,start,orig=false,false,nil,nil
+    ac(handle.InputBegan:Connect(function(i)
+        if St.shut then return end
+        if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+            dragging=true moved=false start=i.Position orig=target.Position
+        end
+    end))
+    ac(UIS.InputChanged:Connect(function(i)
+        if St.shut or not dragging then return end
+        if i.UserInputType==Enum.UserInputType.MouseMovement or i.UserInputType==Enum.UserInputType.Touch then
+            local d=i.Position-start
+            if d.Magnitude>5 then moved=true end
+            if moved then
+                target.Position=UDim2.new(orig.X.Scale,orig.X.Offset+d.X,orig.Y.Scale,orig.Y.Offset+d.Y)
+            end
+        end
+    end))
+    ac(UIS.InputEnded:Connect(function(i)
+        if i.UserInputType==Enum.UserInputType.MouseButton1 or i.UserInputType==Enum.UserInputType.Touch then
+            if dragging then
+                dragging=false
+                if not moved and onTap then onTap() end
+            end
+        end
+    end))
+end
+
+-- ============================ LANGUAGE (TH / EN) ============================
+-- Every label keeps its original text; changing the language re-translates all of them instantly.
+local L={lang=(Cfg.lang=="th") and "th" or "en",reg=setmetatable({},{__mode="k"})}
+do
+    local PAIRS={
+        {"Main","หลัก"},{"Play","เล่น"},{"Macro","มาโคร"},{"Share","แชร์"},{"Settings","ตั้งค่า"},
+        {"Statistics","สถิติ"},{"Automation","ระบบอัตโนมัติ"},{"Fishing Spot","จุดตกปลา"},{"Teleport","เทเลพอร์ต"},
+        {"Game Speed","ความเร็วเกม"},{"Round Automation","ออโต้ในรอบ"},{"Status","สถานะ"},{"Controls","การควบคุม"},
+        {"Cash System","ระบบเงิน"},{"Export","ส่งออก"},{"Import","นำเข้า"},{"Accent Color","สีธีม"},
+        {"Interface","หน้าตา"},{"Utility","เครื่องมือ"},{"Language","ภาษา"},{"Map Select","เลือกแมพ"},{"Mode Vote","โหวตโหมด"},
+        {"Placed","วางแล้ว"},{"Upgraded","อัปเกรดแล้ว"},{"Sold","ขายแล้ว"},
+        {"Auto Summon x10","ออโต้ summon x10"},{"Summon 10 units per second","summon 10 ตัวต่อวินาที"},
+        {"Auto Summon x1","ออโต้ summon x1"},{"Summon 1 unit per second","summon 1 ตัวต่อวินาที"},
+        {"Auto Summon x25","ออโต้ summon x25"},{"Summon 25 units every 0.5 seconds","summon 25 ตัวทุก 0.5 วินาที"},
+        {"Auto Spin","ออโต้หมุนวงล้อ"},{"Spin the wheel automatically","หมุนวงล้ออัตโนมัติ"},
+        {"Auto Open Crate","ออโต้เปิดลัง"},{"Open the selected crate","เปิดลังที่เลือก"},{"Crate","ลัง"},
+        {"Auto Fish","ออโต้ตกปลา"},{"Automatic fishing cycle","ตกปลาอัตโนมัติ"},
+        {"Teleport to Fishing Spot","เทเลพอร์ตไปจุดตกปลา"},{"Fishing spot  (-6831, 26, 1044)","จุดตกปลา  (-6831, 26, 1044)"},
+        {"Teleported","เทเลพอร์ตแล้ว"},{"Teleport failed","เทเลพอร์ตไม่สำเร็จ"},
+        {"Speed","ความเร็ว"},
+        {"Auto Skip Wave","ออโต้ข้ามเวฟ"},{"Skip waves automatically","ข้ามเวฟอัตโนมัติ"},
+        {"Auto Replay","ออโต้เล่นซ้ำ"},{"Vote replay when the round ends","โหวตเล่นซ้ำเมื่อจบรอบ"},
+        {"Auto Lobby","ออโต้กลับล็อบบี้"},{"Return to lobby automatically","กลับล็อบบี้อัตโนมัติ"},
+        {"Map","แมพ"},{"Start Map","เริ่มแมพ"},{"Auto Start Map","ออโต้เริ่มแมพ"},
+        {"Join the selected map automatically","เข้าแมพที่เลือกอัตโนมัติ"},
+        {"Select a map first","เลือกแมพก่อน"},{"JoinQueue remote not found","ไม่พบ remote JoinQueue"},
+        {"Vote mode","โหมดที่โหวต"},{"Vote Now","โหวตเดี๋ยวนี้"},{"Auto Vote","ออโต้โหวต"},
+        {"Vote the selected mode automatically","โหวตโหมดที่เลือกอัตโนมัติ"},
+        {"Select a mode first","เลือกโหมดก่อน"},{"Vote remote not found","ไม่พบ remote โหวต"},
+        {"City","เมือง"},{"Canyon","หุบเขา"},{"WildDesert","ทะเลทรายป่า"},{"Camera Lab","แล็บกล้อง"},
+        {"ToiletBunker","บังเกอร์ห้องน้ำ"},{"Endless Mode","โหมดไม่มีที่สิ้นสุด"},
+        {"Easy","ง่าย"},{"Medium","ปานกลาง"},{"Hard","ยาก"},{"Insane","บ้าคลั่ง"},{"Crazy","สุดโหด"},
+        {"Selected macro","มาโครที่เลือก"},{"New macro name  e.g. EasyFarm","ชื่อมาโครใหม่  เช่น EasyFarm"},
+        {"Create Macro","สร้างมาโคร"},{"Delete Selected Macro","ลบมาโครที่เลือก"},
+        {"Record Macro","บันทึกมาโคร"},{"Captures place / upgrade / sell + exact cost","บันทึกการวาง / อัปเกรด / ขาย + ราคาจริง"},
+        {"Play Macro","เล่นมาโคร"},{"Plays in a loop, round after round","เล่นวนซ้ำ รอบแล้วรอบเล่า"},
+        {"Cash Mode","โหมดเงิน"},{"Wait for the exact cost before place / upgrade","รอเงินให้ครบก่อนวาง / อัปเกรด"},
+        {"Cash source","แหล่งข้อมูลเงิน"},{"Re-detect Cash","ตรวจหาเงินใหม่"},
+        {"Exact costs need a numeric source (leaderstats / attribute / value). A GUI text source such as 1.2K is only approximate.","ราคาที่แม่นยำต้องใช้แหล่งข้อมูลที่เป็นตัวเลข (leaderstats / attribute / value) ส่วนข้อความบน GUI เช่น 1.2K เป็นค่าประมาณเท่านั้น"},
+        {"Macro to export","มาโครที่จะส่งออก"},{"Copy Macro to Clipboard","คัดลอกมาโครไปคลิปบอร์ด"},
+        {"Import and Save","นำเข้าและบันทึก"},{"Macro name (optional - taken from JSON)","ชื่อมาโคร (ไม่บังคับ - ใช้จาก JSON)"},
+        {"Anti AFK","กันเตะ AFK"},{"Prevents the idle kick","ป้องกันการถูกเตะเมื่อไม่ได้ขยับ"},
+        {"UI size","ขนาด UI"},{"Small","เล็ก"},{"Large","ใหญ่"},
+        {"RightShift or the round J button shows / hides the window. Drag the header or the J button to move them.","กด RightShift หรือปุ่ม J กลมๆ เพื่อแสดง / ซ่อนหน้าต่าง ลากแถบด้านบนหรือปุ่ม J เพื่อย้ายตำแหน่ง"},
+        {"Ignore Wave / Time","ไม่นับเวฟ / เวลา"},{"Buy as soon as the cash is enough","ซื้อทันทีที่เงินพอ"},
+        {"Select a language, then press Change Language to apply it instantly.","เลือกภาษา แล้วกดปุ่มเปลี่ยนภาษา ระบบจะเปลี่ยนให้ทันที"},
+        {"Select language","เลือกภาษา"},{"Change Language","เปลี่ยนภาษา"},{"Language changed","เปลี่ยนภาษาแล้ว"},
+        {"Select...","เลือก..."},{"Nothing to select","ไม่มีให้เลือก"},
+        {"Idle","ว่าง"},{"Auto Reconnect","ออโต้เชื่อมต่อใหม่"},{"Rejoin the map automatically after a disconnect or kick","เข้าแมพใหม่อัตโนมัติเมื่อหลุดหรือโดนเตะ"},{"Reconnect Now","เชื่อมต่อใหม่ทันที"},{"Disconnected - reconnecting...","หลุดการเชื่อมต่อ - กำลังเชื่อมต่อใหม่..."},{"Reconnecting...","กำลังเชื่อมต่อใหม่..."},{"Sold OK","ขายแล้ว"},{"Recording","กำลังบันทึก"},{"Playing","กำลังเล่น"},{"Ready","พร้อม"},
+        {"Starting...","กำลังเริ่ม..."},{"Measuring exact costs...","กำลังวัดราคาจริง..."},
+        {"Capturing actions + exact costs","กำลังบันทึกการกระทำ + ราคาจริง"},{"Running macro","กำลังรันมาโคร"},
+        {"Waiting for the round to start...","รอรอบเริ่ม..."},{"Waiting for round","รอรอบเริ่ม"},
+        {"Macro finished - waiting for next round","จบมาโคร - รอรอบถัดไป"},
+        {"Starting macro","เริ่มมาโคร"},{"Preparing...","กำลังเตรียม..."},
+        {"Placed OK","วางสำเร็จ"},{"Upgraded OK","อัพเกรดสำเร็จ"},{"Skipped - no unit to upgrade","ข้าม - ไม่พบตัวที่ต้องอัพเกรด"},
+        {"Selling...","กำลังขาย..."},{"Wave skipped","ข้ามเวฟแล้ว"},{"Speed set","ปรับสปีดแล้ว"},
+        {"Round ended - recording restarted","จบรอบ - เริ่มบันทึกใหม่"},
+        {"Enter a macro name","ใส่ชื่อมาโครก่อน"},{"Select a macro first","เลือกมาโครก่อน"},
+        {"Select or create a macro first","เลือกหรือสร้างมาโครก่อน"},{"Stop playback first","หยุดการเล่นก่อน"},
+        {"Stop recording first","หยุดการบันทึกก่อน"},{"Finishing the previous recording...","กำลังจบการบันทึกก่อนหน้า..."},
+        {"Cash not found - timing mode will be used","ไม่พบเงิน - จะใช้โหมดเวลาแทน"},
+        {"Macro is empty - record it first","มาโครว่างเปล่า - บันทึกก่อน"},{"Macro is empty or invalid","มาโครว่างหรือไม่ถูกต้อง"},
+        {"Failed to build JSON","สร้าง JSON ไม่สำเร็จ"},{"No clipboard function in this executor","executor นี้ไม่มีฟังก์ชันคลิปบอร์ด"},
+        {"Paste the macro JSON first","วาง JSON ของมาโครก่อน"},{"Invalid JSON","JSON ไม่ถูกต้อง"},
+        {"Invalid macro data","ข้อมูลมาโครไม่ถูกต้อง"},{"No valid actions found","ไม่พบการกระทำที่ใช้ได้"},
+        {"Save failed (writefile unsupported?)","บันทึกไม่สำเร็จ (ไม่รองรับ writefile?)"},
+        {"PlaceTower remote not found","ไม่พบ remote PlaceTower"},{"UpgradeTower remote not found","ไม่พบ remote UpgradeTower"},
+        {"Ready  |  cash source not found yet","พร้อม  |  ยังไม่พบแหล่งข้อมูลเงิน"},
+        -- originally Thai strings (so English mode can show them in English)
+        {"Pick fishing spot","เลือกตำแหน่งตกปลา"},{"Clear saved spot","ล้างตำแหน่งที่บันทึก"},
+        {"Cancel (waiting for you to fish in-game...)","ยกเลิก (รอคุณตกปลาในเกม...)"},
+        {"Selection cancelled","ยกเลิกการเลือกตำแหน่ง"},{"Fishing spot saved","บันทึกตำแหน่งตกปลาแล้ว"},
+        {"Fishing spot cleared","ล้างตำแหน่งตกปลาแล้ว"},
+        {"No spot picked - Auto Fish will cast in front of the character","ยังไม่ได้เลือกตำแหน่ง - Auto Fish จะโยนเบ็ดหน้าตัวละครแทน"},
+        {"Press the pick button, then cast once in-game at the spot you want. The script saves it for you.","กดปุ่มเลือก แล้วไปตกปลาในเกมตรงจุดที่ต้องการ 1 ครั้ง สคริปจะบันทึกตำแหน่งนั้นให้เอง"},
+        {"Go cast in-game at the spot you want and the script will save it","ไปกดตกปลาในเกมตรงจุดที่ต้องการ แล้วสคริปจะบันทึกให้"},
+    }
+    local PREF={
+        {"Crate: ","ลัง: "},{"Source: ","แหล่งข้อมูล: ",true},{"Saved spot: ","ตำแหน่งที่บันทึก: ",true},
+        {"Macro ready: ","พร้อมใช้มาโคร: "},{"Deleted ","ลบแล้ว: "},{"Recording -> ","กำลังบันทึก -> "},
+        {"Resumed play -> ","เล่นต่อ -> "},{"Imported ","นำเข้า "},{"Saved ","บันทึก "},
+        {"Macro copied (","คัดลอกมาโครแล้ว ("},{"Clipboard error: ","คลิปบอร์ดผิดพลาด: "},
+        {"Joining queue: ","กำลังเข้าคิว: "},{"Voted: ","โหวตแล้ว: "},{"Cash ","เงิน "},
+        {"Ready  |  cash ","พร้อม  |  เงิน "},{"Placing(","กำลังวางตัว(",true},{"Upgrading(#","กำลังอัพเกรด(#",true},
+        {"Could not place ","วางไม่สำเร็จ "},{"Nothing recorded","ไม่มีอะไรถูกบันทึก"},
+    }
+    local SUBS={
+        {" steps"," ขั้นตอน"},{"cash mode","โหมดเงิน"},{"timing mode","โหมดเวลา"},{"(exact)","(แน่นอน)"},
+        {"(approximate)","(ประมาณ)"},{" ~approx"," ~ประมาณ"},{" exact"," แน่นอน"},{"cash NOT found","ไม่พบเงิน"},
+        {"  |  cash ","  |  เงิน "},{"costs unknown, will be learned","ไม่ทราบราคา จะเรียนรู้เอง"},
+        {"every cost captured","จับราคาครบทุกขั้น"},{"not detected","ยังไม่พบ"},{"(step ","(ขั้นที่ "},
+        {"Place(","วางตัว("},{"Upgrade(","อัพเกรด("},{"Sell(","ขายตัว("},{"Skip wave()","ข้ามเวฟ()"},{"Speed(","ปรับสปีด("},
+    }
+    local RULES={
+        {"^Place (%d+)  |  Upgrade (%d+)  |  Sell (%d+)$","^วาง (%d+)  |  อัปเกรด (%d+)  |  ขาย (%d+)$","Place %s  |  Upgrade %s  |  Sell %s","วาง %s  |  อัปเกรด %s  |  ขาย %s"},
+        {"^(%d+) actions$","^(%d+) การกระทำ$","%s actions","%s การกระทำ"},
+        {"^Step (%d+) / (%d+)$","^ขั้นที่ (%d+) / (%d+)$","Step %s / %s","ขั้นที่ %s / %s"},
+        {"^Waiting for cash %$(.-)  %(have %$(.-)  short %$(.-)%)$","^รอเงิน %$(.-)  %(มี %$(.-)  ขาดอีก %$(.-)%)$","Waiting for cash $%s  (have $%s  short $%s)","รอเงิน $%s  (มี $%s  ขาดอีก $%s)"},
+        {"^Waiting wave%((%d+)%)  now wave (%d+)$","^รอเวฟ%((%d+)%)  ตอนนี้เวฟ (%d+)$","Waiting wave(%s)  now wave %s","รอเวฟ(%s)  ตอนนี้เวฟ %s"},
+        {"^Waiting%((.-)%)$","^รอเวลา%((.-)%)$","Waiting(%s)","รอเวลา(%s)"},
+        {"^Trying price (.-) %.%.%.$","^ลองซื้อที่ราคา (.-) %.%.%.$","Trying price %s ...","ลองซื้อที่ราคา %s ..."},
+        {"^Round (%d+) | (.*)$","^รอบ (%d+) | (.*)$","Round %s | %s","รอบ %s | %s"},
+        {"^Next  (.*)$","^ถัดไป  (.*)$","Next  %s","ถัดไป  %s"},
+        {"^Fixed macro cost at step (%d+): (.-) %->  ?(.-)$","^แก้ราคาในมาโคร ขั้น (%d+): (.-) →  ?(.-)$","Fixed macro cost at step %s: %s -> %s","แก้ราคาในมาโคร ขั้น %s: %s → %s"},
+        {"^(%d+): (.*)$","^(%d+): (.*)$","%s: %s","%s: %s"},
+    }
+    local TH,EN={},{}
+    for _,p in ipairs(PAIRS) do
+        TH[p[1]]=p[2]
+        TH[string.upper(p[1])]=p[2]
+        if EN[p[2]]==nil then EN[p[2]]=p[1] end
+    end
+    local function subs(s,a,b)
+        for _,p in ipairs(SUBS) do
+            local i,j=string.find(s,p[a],1,true)
+            if i then s=string.sub(s,1,i-1)..p[b]..string.sub(s,j+1) end
+        end
+        return s
+    end
+    local function startsWith(s,p) return string.sub(s,1,#p)==p end
+    function L.tr(s,isLabel)
+        if type(s)~="string" or s=="" then return s end
+        local toTh=(L.lang=="th")
+        local v
+        if toTh then v=TH[s] else v=EN[s] end
+        if v then return v end
+        local from,to=toTh and 1 or 2,toTh and 2 or 1
+        for _,r in ipairs(RULES) do
+            local caps={string.match(s,toTh and r[1] or r[2])}
+            if #caps>0 then
+                local ok,res=pcall(string.format,toTh and r[4] or r[3],table.unpack(caps))
+                if ok then return subs(res,from,to) end
+            end
+        end
+        for _,p in ipairs(PREF) do
+            if (not isLabel or p[3]) and startsWith(s,p[from]) then
+                return subs(p[to]..string.sub(s,#p[from]+1),from,to)
+            end
+        end
+        if isLabel then return s end
+        return subs(s,from,to)
+    end
+end
+-- Event driven: every label is translated the moment its Text changes (same frame),
+-- so the script's own English text never shows up between two polling ticks.
+function L.sync(d,e)
+    if e.busy or St.shut then return end
+    local cur=d.Text
+    if cur==e.t then return end          -- this is our own translated text
+    e.o=cur                               -- the script wrote new text -> new original
+    local nt=L.tr(cur,true)
+    e.t=nt
+    if nt~=cur then
+        e.busy=true
+        pcall(function() d.Text=nt end)
+        e.busy=false
+    end
+end
+function L.hook(d)
+    if L.reg[d] then return L.reg[d] end
+    if not (d:IsA("TextLabel") or d:IsA("TextButton")) then return nil end
+    local e={o=d.Text,t=d.Text,busy=false}
+    L.reg[d]=e
+    local cur=d.Text
+    if cur~="" then
+        local nt=L.tr(cur,true)
+        e.t=nt
+        if nt~=cur then
+            e.busy=true
+            pcall(function() d.Text=nt end)
+            e.busy=false
+        end
+    end
+    d:GetPropertyChangedSignal("Text"):Connect(function() L.sync(d,e) end)
+    return e
+end
+function L.apply()
+    if St.shut then return end
+    for _,d in ipairs(sg:GetDescendants()) do
+        if d:IsA("TextLabel") or d:IsA("TextButton") then
+            local e=L.reg[d]
+            if e then L.sync(d,e) else L.hook(d) end
+        end
+    end
+end
+function L.set(lang)
+    L.lang=(lang=="th") and "th" or "en"
+    if St.shut then return end
+    for _,d in ipairs(sg:GetDescendants()) do
+        if d:IsA("TextLabel") or d:IsA("TextButton") then
+            local e=L.reg[d] or L.hook(d)
+            if e then
+                local cur=d.Text
+                if cur~=e.t then e.o=cur end
+                local nt=L.tr(e.o,true)
+                e.t=nt
+                if nt~=cur then
+                    e.busy=true
+                    pcall(function() d.Text=nt end)
+                    e.busy=false
+                end
+            end
+        end
+    end
+end
+ac(sg.DescendantAdded:Connect(function(d)
+    if St.shut then return end
+    if d:IsA("TextLabel") or d:IsA("TextButton") then task.defer(L.hook,d) end
+end))
+task.spawn(function()
+    while not St.shut do
+        pcall(L.apply)       -- safety net only
+        task.wait(0.5)
+    end
+end)
+
+-- ============================ NOTIFICATIONS ============================
+local nHost=mk("Frame",{Size=UDim2.fromOffset(260,420),AnchorPoint=Vector2.new(1,1),Position=UDim2.new(1,-14,1,-14),BackgroundTransparency=1,ZIndex=80},sg)
+mk("UIListLayout",{SortOrder=Enum.SortOrder.LayoutOrder,VerticalAlignment=Enum.VerticalAlignment.Bottom,HorizontalAlignment=Enum.HorizontalAlignment.Right,Padding=UDim.new(0,6)},nHost)
+local nOrd=0
+local function N(msg,kind,title)
+    if St.shut then return end
+    nOrd=nOrd+1
+    local col=(kind=="ok" and K.ok) or (kind=="bad" and K.bad) or (kind=="warn" and K.warn) or K.ac
+    local kids={}
+    for _,ch in ipairs(nHost:GetChildren()) do if ch:IsA("Frame") then kids[#kids+1]=ch end end
+    if #kids>=5 then
+        table.sort(kids,function(a,b) return a.LayoutOrder<b.LayoutOrder end)
+        pcall(function() kids[1]:Destroy() end)
+    end
+    local wrap=mk("Frame",{Size=UDim2.new(1,0,0,52),BackgroundTransparency=1,LayoutOrder=nOrd},nHost)
+    local f=mk("Frame",{Size=UDim2.fromScale(1,1),Position=UDim2.new(1.3,0,0,0),BackgroundColor3=K.card,BorderSizePixel=0,ClipsDescendants=true},wrap)
+    corner(f,10)
+    stroke(f,K.line,1,0.1)
+    local bar=mk("Frame",{Size=UDim2.new(0,3,1,0),BackgroundColor3=col,BorderSizePixel=0},f)
+    T(f,title or HUB_FULL,10,col,Enum.Font.GothamBold,{Position=UDim2.fromOffset(14,7),Size=UDim2.new(1,-24,0,13)})
+    T(f,L.tr(tostring(msg)),11,K.tx,Enum.Font.Gotham,{Position=UDim2.fromOffset(14,22),Size=UDim2.new(1,-24,0,22),TextTruncate=Enum.TextTruncate.AtEnd,TextWrapped=true,TextYAlignment=Enum.TextYAlignment.Top})
+    local pr=mk("Frame",{Size=UDim2.new(1,0,0,2),Position=UDim2.new(0,0,1,-2),BackgroundColor3=col,BackgroundTransparency=0.3,BorderSizePixel=0},f)
+    tw(f,0.38,{Position=UDim2.fromOffset(0,0)},Enum.EasingStyle.Back)
+    tw(pr,3.2,{Size=UDim2.new(0,0,0,2)},Enum.EasingStyle.Linear)
+    task.delay(3.3,function()
+        if not f or not f.Parent then return end
+        tw(f,0.3,{Position=UDim2.new(1.3,0,0,0)},Enum.EasingStyle.Quart,Enum.EasingDirection.In)
+        task.delay(0.35,function() pcall(function() wrap:Destroy() end) end)
+    end)
+end
+
+-- ============================ WINDOW ============================
+local BASE_W,BASE_H=540,344
+local holder=mk("Frame",{Name="Holder",Size=UDim2.fromOffset(BASE_W,BASE_H),AnchorPoint=Vector2.new(0.5,0.5),Position=UDim2.fromScale(0.5,0.5),BackgroundTransparency=1},sg)
+local win=mk("CanvasGroup",{Size=UDim2.fromScale(1,1),AnchorPoint=Vector2.new(0.5,0.5),Position=UDim2.fromScale(0.5,0.5),BackgroundColor3=K.bg,BorderSizePixel=0,GroupTransparency=1},holder)
+corner(win,14)
+local winSt=stroke(win,K.line,1,0.05)
+local uiScale=mk("UIScale",{Scale=0.92},win)
+local baseScale=1
+local function fit()
+    if St.shut then return end
+    pcall(function()
+        local cam=workspace.CurrentCamera
+        if not cam then return end
+        local vp=cam.ViewportSize
+        if vp.X<=0 or vp.Y<=0 then return end
+        local s=math.min(1,(vp.X*0.96)/BASE_W,(vp.Y*0.9)/BASE_H)*(tonumber(Cfg.uis) or 1)
+        baseScale=math.clamp(s,0.5,1.4)
+        if St.visible and win.GroupTransparency<0.5 then uiScale.Scale=baseScale end
+    end)
+end
+fit()
+pcall(function() ac(workspace.CurrentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(fit)) end)
+
+-- header
+local hdr=mk("Frame",{Size=UDim2.new(1,0,0,48),BackgroundColor3=K.side,BorderSizePixel=0},win)
+local hLine=mk("Frame",{Size=UDim2.new(1,0,0,1),Position=UDim2.new(0,0,1,-1),BorderSizePixel=0},hdr)
+th(hLine,"BackgroundColor3")
+mk("UIGradient",{Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0,0.05),NumberSequenceKeypoint.new(0.6,0.75),NumberSequenceKeypoint.new(1,1)})},hLine)
+local logo=mk("Frame",{Size=UDim2.fromOffset(30,30),Position=UDim2.fromOffset(14,9),BorderSizePixel=0},hdr)
+corner(logo,9)
+th(logo,"BackgroundColor3")
+mk("UIGradient",{Rotation=45,Color=ColorSequence.new(WHITE,Color3.fromRGB(165,165,175))},logo)
+T(logo,"J",17,WHITE,Enum.Font.GothamBlack,{Size=UDim2.fromScale(1,1),TextXAlignment=Enum.TextXAlignment.Center})
+local tbox=mk("Frame",{Size=UDim2.new(0,200,1,0),Position=UDim2.fromOffset(52,0),BackgroundTransparency=1},hdr)
+mk("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,VerticalAlignment=Enum.VerticalAlignment.Center,Padding=UDim.new(0,8),SortOrder=Enum.SortOrder.LayoutOrder},tbox)
+mk("TextLabel",{AutomaticSize=Enum.AutomaticSize.X,Size=UDim2.new(0,0,0,20),BackgroundTransparency=1,Text=HUB_NAME,Font=Enum.Font.GothamBlack,TextSize=16,TextColor3=K.tx,LayoutOrder=1},tbox)
+local chip=mk("Frame",{AutomaticSize=Enum.AutomaticSize.X,Size=UDim2.fromOffset(0,16),BackgroundTransparency=0.8,BorderSizePixel=0,LayoutOrder=2},tbox)
+corner(chip,5)
+th(chip,"BackgroundColor3")
+pad(chip,7,0,7,0)
+local chipT=mk("TextLabel",{AutomaticSize=Enum.AutomaticSize.X,Size=UDim2.new(0,0,1,0),BackgroundTransparency=1,Text=HUB_TAG,Font=Enum.Font.GothamBold,TextSize=9},chip)
+th(chipT,"TextColor3")
+
+local rbox=mk("Frame",{AnchorPoint=Vector2.new(1,0.5),Position=UDim2.new(1,-10,0.5,0),Size=UDim2.fromOffset(210,28),BackgroundTransparency=1},hdr)
+mk("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,HorizontalAlignment=Enum.HorizontalAlignment.Right,VerticalAlignment=Enum.VerticalAlignment.Center,Padding=UDim.new(0,6),SortOrder=Enum.SortOrder.LayoutOrder},rbox)
+local cashChip=mk("Frame",{Size=UDim2.fromOffset(104,24),BackgroundColor3=K.el,BorderSizePixel=0,LayoutOrder=1},rbox)
+corner(cashChip,8)
+stroke(cashChip,K.line,1,0.4)
+X.hdrCash=T(cashChip,"$ --",11,K.ok,Enum.Font.GothamBold,{Size=UDim2.fromScale(1,1),TextXAlignment=Enum.TextXAlignment.Center})
+local function hdrBtn(txt,order,hov)
+    local b=mk("TextButton",{Size=UDim2.fromOffset(28,28),BackgroundColor3=K.el,BorderSizePixel=0,Font=Enum.Font.GothamBold,TextSize=14,TextColor3=K.sb,Text=txt,AutoButtonColor=false,LayoutOrder=order},rbox)
+    corner(b,8)
+    ac(b.MouseEnter:Connect(function() tw(b,0.15,{BackgroundColor3=hov,TextColor3=WHITE}) end))
+    ac(b.MouseLeave:Connect(function() tw(b,0.15,{BackgroundColor3=K.el,TextColor3=K.sb}) end))
+    return b
+end
+local minB=hdrBtn("-",2,K.line)
+local xb=hdrBtn("x",3,Color3.fromRGB(200,70,76))
+dragify(hdr,holder)
+
+-- body / sidebar / content / footer
+local FOOT_H=26
+local body=mk("Frame",{Size=UDim2.new(1,0,1,-(48+FOOT_H)),Position=UDim2.fromOffset(0,48),BackgroundTransparency=1},win)
+local side=mk("Frame",{Size=UDim2.new(0,132,1,0),BackgroundColor3=K.side,BorderSizePixel=0},body)
+mk("Frame",{Size=UDim2.new(0,1,1,0),Position=UDim2.new(1,-1,0,0),BackgroundColor3=K.line,BackgroundTransparency=0.4,BorderSizePixel=0},side)
+local content=mk("Frame",{Size=UDim2.new(1,-132,1,0),Position=UDim2.fromOffset(132,0),BackgroundTransparency=1,ClipsDescendants=true},body)
+local foot=mk("Frame",{Size=UDim2.new(1,0,0,FOOT_H),Position=UDim2.new(0,0,1,-FOOT_H),BackgroundColor3=K.side,BorderSizePixel=0},win)
+mk("Frame",{Size=UDim2.new(1,0,0,1),BackgroundColor3=K.line,BackgroundTransparency=0.4,BorderSizePixel=0},foot)
+local fDot=mk("Frame",{Size=UDim2.fromOffset(6,6),Position=UDim2.new(0,14,0.5,-3),BorderSizePixel=0},foot)
+corner(fDot,3)
+X.fDot=fDot
+X.ftStat=T(foot,"Place 0  |  Upgrade 0  |  Sell 0",10,K.mt,Enum.Font.Gotham,{Position=UDim2.fromOffset(28,0),Size=UDim2.new(0.6,0,1,0)})
+X.ftCash=T(foot,HUB_FULL,10,K.mt,Enum.Font.GothamBold,{Position=UDim2.new(0.5,0,0,0),Size=UDim2.new(0.5,-14,1,0),TextXAlignment=Enum.TextXAlignment.Right})
+X.setDot=function(c) tw(fDot,0.25,{BackgroundColor3=c}) end
+X.setDot(K.mt)
+
+-- tabs
+local pages,tabBtns,tabIdx,cur={},{},{},nil
+local TAB_H,TAB_GAP=34,4
+local tabNames={"Main","Play","Macro","Share","Settings"}
+local hl=mk("Frame",{Size=UDim2.new(1,-16,0,TAB_H),Position=UDim2.fromOffset(8,12),BackgroundTransparency=0.86,BorderSizePixel=0},side)
+corner(hl,9)
+th(hl,"BackgroundColor3")
+local hlBar=mk("Frame",{Size=UDim2.fromOffset(3,16),Position=UDim2.new(0,0,0.5,-8),BorderSizePixel=0},hl)
+corner(hlBar,2)
+th(hlBar,"BackgroundColor3")
+local function go(n)
+    if St.shut or cur==n then return end
+    for k,p in pairs(pages) do p.Visible=(k==n) end
+    local pg=pages[n]
+    if pg then
+        pg.Position=UDim2.fromOffset(0,10)
+        tw(pg,0.26,{Position=UDim2.fromOffset(0,0)})
+    end
+    tw(hl,0.26,{Position=UDim2.fromOffset(8,12+(tabIdx[n]-1)*(TAB_H+TAB_GAP))})
+    for k,b in pairs(tabBtns) do tw(b,0.2,{TextColor3=(k==n) and K.ac or K.sb}) end
+    cur=n
+end
+for i,n in ipairs(tabNames) do
+    tabIdx[n]=i
+    local b=mk("TextButton",{Size=UDim2.new(1,-16,0,TAB_H),Position=UDim2.fromOffset(8,12+(i-1)*(TAB_H+TAB_GAP)),BackgroundTransparency=1,BorderSizePixel=0,Font=Enum.Font.GothamMedium,TextSize=12,TextColor3=K.sb,Text=n,AutoButtonColor=false,TextXAlignment=Enum.TextXAlignment.Left},side)
+    pad(b,16,0,0,0)
+    tabBtns[n]=b
+    th(b,"TextColor3",function() return (cur==n) and K.ac or K.sb end)
+    ac(b.MouseButton1Click:Connect(function() go(n) end))
+    ac(b.MouseEnter:Connect(function() if cur~=n then tw(b,0.15,{TextColor3=K.tx}) end end))
+    ac(b.MouseLeave:Connect(function() if cur~=n then tw(b,0.15,{TextColor3=K.sb}) end end))
+end
+-- player chip
+local pc=mk("Frame",{Size=UDim2.new(1,-16,0,40),Position=UDim2.new(0,8,1,-48),BackgroundColor3=K.el,BorderSizePixel=0},side)
+corner(pc,10)
+local av=mk("Frame",{Size=UDim2.fromOffset(26,26),Position=UDim2.fromOffset(7,7),BorderSizePixel=0},pc)
+corner(av,13)
+th(av,"BackgroundColor3")
+T(av,string.upper(string.sub(PLR.DisplayName,1,1)),12,WHITE,Enum.Font.GothamBold,{Size=UDim2.fromScale(1,1),TextXAlignment=Enum.TextXAlignment.Center})
+T(pc,PLR.DisplayName,11,K.tx,Enum.Font.GothamMedium,{Position=UDim2.fromOffset(40,5),Size=UDim2.new(1,-46,0,15),TextTruncate=Enum.TextTruncate.AtEnd})
+T(pc,"@"..PLR.Name,9,K.mt,Enum.Font.Gotham,{Position=UDim2.fromOffset(40,20),Size=UDim2.new(1,-46,0,13),TextTruncate=Enum.TextTruncate.AtEnd})
+
+-- ============================ COMPONENTS ============================
+local function nxt(o) o.n=o.n+1 return o.n end
+local function Page(name)
+    local sf=mk("ScrollingFrame",{
+        Name=name,Size=UDim2.fromScale(1,1),BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=3,
+        ScrollBarImageColor3=K.line,CanvasSize=UDim2.new(),AutomaticCanvasSize=Enum.AutomaticSize.Y,
+        ScrollingDirection=Enum.ScrollingDirection.Y,Visible=false,ElasticBehavior=Enum.ElasticBehavior.Never
+    },content)
+    pad(sf,12,12,14,12)
+    vlist(sf,10)
+    pages[name]=sf
+    return {f=sf,n=0}
+end
+local function Card(pg,title)
+    local f=mk("Frame",{Size=UDim2.new(1,0,0,0),AutomaticSize=Enum.AutomaticSize.Y,BackgroundColor3=K.card,BorderSizePixel=0,LayoutOrder=nxt(pg)},pg.f)
+    corner(f,12)
+    stroke(f,K.line,1,0.3)
+    pad(f,12,10,12,12)
+    vlist(f,8)
+    local c={f=f,n=0}
+    local hd=mk("Frame",{Size=UDim2.new(1,0,0,16),BackgroundTransparency=1,LayoutOrder=nxt(c)},f)
+    local bar=mk("Frame",{Size=UDim2.fromOffset(3,12),Position=UDim2.fromOffset(0,2),BorderSizePixel=0},hd)
+    corner(bar,2)
+    th(bar,"BackgroundColor3")
+    local tt=T(hd,string.upper(title),10,K.ac,Enum.Font.GothamBold,{Position=UDim2.fromOffset(10,0),Size=UDim2.new(1,-10,1,0)})
+    th(tt,"TextColor3")
+    return c
+end
+local function Note(card,text,col)
+    return T(card.f,text,10,col or K.sb,Enum.Font.Gotham,{Size=UDim2.new(1,0,0,0),AutomaticSize=Enum.AutomaticSize.Y,TextWrapped=true,TextYAlignment=Enum.TextYAlignment.Top,LayoutOrder=nxt(card)})
+end
+
+local function Toggle(card,name,desc,init,cb)
+    local h=desc and 46 or 38
+    local row=mk("Frame",{Size=UDim2.new(1,0,0,h),BackgroundColor3=K.el,BorderSizePixel=0,LayoutOrder=nxt(card)},card.f)
+    corner(row,9)
+    local rs=stroke(row,K.line,1,0.55)
+    T(row,name,12,K.tx,Enum.Font.GothamMedium,{Position=UDim2.fromOffset(12,desc and 7 or 0),Size=UDim2.new(1,-72,0,desc and 16 or h)})
+    if desc then
+        T(row,desc,10,K.sb,Enum.Font.Gotham,{Position=UDim2.fromOffset(12,24),Size=UDim2.new(1,-72,0,14),TextTruncate=Enum.TextTruncate.AtEnd})
+    end
+    local st=init and true or false
+    local sw=mk("Frame",{Size=UDim2.fromOffset(42,24),AnchorPoint=Vector2.new(1,0.5),Position=UDim2.new(1,-12,0.5,0),BackgroundColor3=K.off,BorderSizePixel=0},row)
+    corner(sw,12)
+    local swS=stroke(sw,K.line,1,0.2)
+    th(swS,"Color",function() return st and K.ac or K.line end)
+    local fill=mk("Frame",{Size=UDim2.fromScale(1,1),BackgroundTransparency=st and 0 or 1,BorderSizePixel=0},sw)
+    corner(fill,12)
+    th(fill,"BackgroundColor3")
+    mk("UIGradient",{Color=ColorSequence.new(WHITE,Color3.fromRGB(185,185,195))},fill)
+    local function kpos(on) return UDim2.fromOffset(on and 21 or 3,3) end
+    local kn=mk("Frame",{Size=UDim2.fromOffset(18,18),Position=kpos(st),BackgroundColor3=WHITE,BorderSizePixel=0},sw)
+    corner(kn,9)
+    local function apply(v)
+        st=v and true or false
+        if St.shut then return end
+        tw(fill,0.22,{BackgroundTransparency=st and 0 or 1})
+        tw(swS,0.22,{Color=st and K.ac or K.line})
+        tw(kn,0.12,{Size=UDim2.fromOffset(24,18),Position=UDim2.fromOffset(st and 15 or 3,3)})
+        task.delay(0.12,function()
+            if kn and kn.Parent and not St.shut then
+                tw(kn,0.18,{Size=UDim2.fromOffset(18,18),Position=kpos(st)},Enum.EasingStyle.Back)
+            end
+        end)
+    end
+    local z=mk("TextButton",{Size=UDim2.fromScale(1,1),BackgroundTransparency=1,Text="",AutoButtonColor=false},row)
+    ac(z.MouseEnter:Connect(function() tw(row,0.15,{BackgroundColor3=Color3.fromRGB(35,35,48)}) tw(rs,0.15,{Transparency=0.2}) end))
+    ac(z.MouseLeave:Connect(function() tw(row,0.15,{BackgroundColor3=K.el}) tw(rs,0.15,{Transparency=0.55}) end))
+    ac(z.MouseButton1Click:Connect(function()
+        if St.shut then return end
+        apply(not st)
+        if cb then cb(st) end
+    end))
+    return {GetValue=function() return st end,SetValue=function(v) apply(v) end}
+end
+
+local function Button(card,text,kind,cb)
+    local function base()
+        if kind=="p" then return K.ac end
+        if kind=="d" then return Color3.fromRGB(66,32,38) end
+        return K.el
+    end
+    local b=mk("TextButton",{Size=UDim2.new(1,0,0,34),BackgroundColor3=base(),BorderSizePixel=0,Font=Enum.Font.GothamBold,TextSize=12,TextColor3=(kind=="p") and WHITE or ((kind=="d") and Color3.fromRGB(255,150,155) or K.tx),Text=text,AutoButtonColor=false,LayoutOrder=nxt(card)},card.f)
+    corner(b,9)
+    local bs=mk("UIScale",{Scale=1},b)
+    if kind=="p" then
+        th(b,"BackgroundColor3")
+        mk("UIGradient",{Rotation=90,Color=ColorSequence.new(WHITE,Color3.fromRGB(200,200,210))},b)
+    else
+        stroke(b,(kind=="d") and Color3.fromRGB(120,52,60) or K.line,1,0.4)
+    end
+    ac(b.MouseEnter:Connect(function() tw(b,0.14,{BackgroundColor3=base():Lerp(WHITE,0.12)}) end))
+    ac(b.MouseLeave:Connect(function() tw(b,0.14,{BackgroundColor3=base()}) tw(bs,0.1,{Scale=1}) end))
+    ac(b.MouseButton1Down:Connect(function() tw(bs,0.08,{Scale=0.96}) end))
+    ac(b.MouseButton1Up:Connect(function() tw(bs,0.12,{Scale=1},Enum.EasingStyle.Back) end))
+    if cb then ac(b.MouseButton1Click:Connect(function() if not St.shut then cb(b) end end)) end
+    return b
+end
+
+local function Input(card,ph,init,h,multi)
+    local f=mk("Frame",{Size=UDim2.new(1,0,0,h or 36),BackgroundColor3=K.bg,BorderSizePixel=0,LayoutOrder=nxt(card)},card.f)
+    corner(f,9)
+    local fs=stroke(f,K.line,1,0.2)
+    local tb=mk("TextBox",{
+        Size=UDim2.new(1,-20,1,multi and -14 or 0),Position=UDim2.fromOffset(10,multi and 7 or 0),BackgroundTransparency=1,
+        Font=Enum.Font.Gotham,TextSize=11,TextColor3=K.tx,PlaceholderText=ph,PlaceholderColor3=K.mt,Text=init or "",
+        ClearTextOnFocus=false,TextXAlignment=Enum.TextXAlignment.Left,
+        TextYAlignment=multi and Enum.TextYAlignment.Top or Enum.TextYAlignment.Center,
+        TextWrapped=multi and true or false,MultiLine=multi and true or false,ClipsDescendants=true
+    },f)
+    ac(tb.Focused:Connect(function() tw(fs,0.15,{Color=K.ac,Transparency=0}) end))
+    ac(tb.FocusLost:Connect(function() tw(fs,0.15,{Color=K.line,Transparency=0.2}) end))
+    return tb
+end
+
+local popup
+local function closePopup()
+    if popup then pcall(function() popup:Destroy() end) popup=nil end
+end
+local function openList(anchor,opts,curv,pick)
+    closePopup()
+    if #opts==0 then N("Nothing to select","warn") return end
+    local scrim=mk("TextButton",{Size=UDim2.fromScale(1,1),BackgroundTransparency=1,Text="",AutoButtonColor=false,ZIndex=60},sg)
+    popup=scrim
+    scrim.MouseButton1Click:Connect(closePopup)
+    local ap,as=anchor.AbsolutePosition,anchor.AbsoluteSize
+    local vp=sg.AbsoluteSize
+    local w=math.max(as.X,160)
+    local h=math.min(#opts*30+8,200)
+    local x=math.clamp(ap.X+as.X-w,6,math.max(6,vp.X-w-6))
+    local y=ap.Y+as.Y+4
+    if y+h>vp.Y-6 then y=math.max(6,ap.Y-h-4) end
+    local fr=mk("Frame",{Size=UDim2.fromOffset(w,0),Position=UDim2.fromOffset(x,y),BackgroundColor3=K.el,BorderSizePixel=0,ClipsDescendants=true},scrim)
+    corner(fr,10)
+    stroke(fr,K.line,1,0.1)
+    tw(fr,0.2,{Size=UDim2.fromOffset(w,h)})
+    local sf=mk("ScrollingFrame",{Size=UDim2.fromScale(1,1),BackgroundTransparency=1,BorderSizePixel=0,ScrollBarThickness=2,CanvasSize=UDim2.new(),AutomaticCanvasSize=Enum.AutomaticSize.Y},fr)
+    pad(sf,4)
+    vlist(sf,2)
+    for i,v in ipairs(opts) do
+        local sel=(v==curv)
+        local ob=mk("TextButton",{Size=UDim2.new(1,0,0,28),BackgroundColor3=K.card,BackgroundTransparency=sel and 0 or 1,BorderSizePixel=0,Font=Enum.Font.GothamMedium,TextSize=11,TextColor3=sel and K.ac or K.tx,Text=tostring(v),TextXAlignment=Enum.TextXAlignment.Left,TextTruncate=Enum.TextTruncate.AtEnd,AutoButtonColor=false,LayoutOrder=i},sf)
+        corner(ob,7)
+        pad(ob,10,0,10,0)
+        ob.MouseEnter:Connect(function() tw(ob,0.1,{BackgroundTransparency=0,BackgroundColor3=K.card}) end)
+        ob.MouseLeave:Connect(function() tw(ob,0.1,{BackgroundTransparency=sel and 0 or 1}) end)
+        ob.MouseButton1Click:Connect(function()
+            closePopup()
+            pick(v)
+        end)
+    end
+    L.apply()
+end
+
+local function Dropdown(card,label,getOpts,getVal,onPick)
+    local row=mk("Frame",{Size=UDim2.new(1,0,0,38),BackgroundColor3=K.el,BorderSizePixel=0,LayoutOrder=nxt(card)},card.f)
+    corner(row,9)
+    stroke(row,K.line,1,0.55)
+    T(row,label,12,K.tx,Enum.Font.GothamMedium,{Position=UDim2.fromOffset(12,0),Size=UDim2.new(1,-190,1,0)})
+    local b=mk("TextButton",{Size=UDim2.fromOffset(160,26),AnchorPoint=Vector2.new(1,0.5),Position=UDim2.new(1,-8,0.5,0),BackgroundColor3=K.card,BorderSizePixel=0,Text="",AutoButtonColor=false},row)
+    corner(b,7)
+    stroke(b,K.line,1,0.3)
+    local vl=T(b,"",11,K.tx,Enum.Font.GothamMedium,{Position=UDim2.fromOffset(10,0),Size=UDim2.new(1,-30,1,0),TextTruncate=Enum.TextTruncate.AtEnd})
+    T(b,"v",11,K.sb,Enum.Font.GothamBold,{Position=UDim2.new(1,-18,0,0),Size=UDim2.fromOffset(12,26),TextXAlignment=Enum.TextXAlignment.Center})
+    local function refresh()
+        local v=getVal()
+        vl.Text=(v~=nil and tostring(v)~="") and tostring(v) or "Select..."
+        vl.TextColor3=(v~=nil and tostring(v)~="") and K.tx or K.mt
+    end
+    ac(b.MouseEnter:Connect(function() tw(b,0.12,{BackgroundColor3=K.bg}) end))
+    ac(b.MouseLeave:Connect(function() tw(b,0.12,{BackgroundColor3=K.card}) end))
+    ac(b.MouseButton1Click:Connect(function()
+        if St.shut then return end
+        openList(b,getOpts(),getVal(),function(v) onPick(v) refresh() end)
+    end))
+    refresh()
+    return {Refresh=refresh}
+end
+
+local function Tiles(card,names)
+    local row=mk("Frame",{Size=UDim2.new(1,0,0,60),BackgroundTransparency=1,LayoutOrder=nxt(card)},card.f)
+    mk("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,Padding=UDim.new(0,8),SortOrder=Enum.SortOrder.LayoutOrder},row)
+    local n=#names
+    local vals={}
+    for i,nm in ipairs(names) do
+        local t=mk("Frame",{Size=UDim2.new(1/n,-math.ceil(8*(n-1)/n),1,0),BackgroundColor3=K.el,BorderSizePixel=0,LayoutOrder=i},row)
+        corner(t,10)
+        stroke(t,K.line,1,0.55)
+        vals[i]=T(t,"0",22,K.tx,Enum.Font.GothamBold,{Position=UDim2.fromOffset(12,8),Size=UDim2.new(1,-24,0,26)})
+        T(t,nm,10,K.sb,Enum.Font.Gotham,{Position=UDim2.fromOffset(12,36),Size=UDim2.new(1,-24,0,14)})
+    end
+    return vals
+end
+
+-- ============================ FLOATING ORB ============================
+local orb=mk("TextButton",{Size=UDim2.fromOffset(48,48),Position=UDim2.new(0,18,0.5,-24),BackgroundColor3=K.card,BorderSizePixel=0,Text="",AutoButtonColor=false,ZIndex=30},sg)
+corner(orb,24)
+local orbRing=stroke(orb,K.ac,2,0.15)
+th(orbRing,"Color")
+local orbIn=mk("Frame",{Size=UDim2.fromOffset(34,34),AnchorPoint=Vector2.new(0.5,0.5),Position=UDim2.fromScale(0.5,0.5),BorderSizePixel=0},orb)
+corner(orbIn,17)
+th(orbIn,"BackgroundColor3")
+mk("UIGradient",{Rotation=45,Color=ColorSequence.new(WHITE,Color3.fromRGB(160,160,172))},orbIn)
+T(orbIn,"J",16,WHITE,Enum.Font.GothamBlack,{Size=UDim2.fromScale(1,1),TextXAlignment=Enum.TextXAlignment.Center})
+local orbDot=mk("Frame",{Size=UDim2.fromOffset(12,12),Position=UDim2.new(1,-13,1,-13),BackgroundColor3=K.mt,BorderSizePixel=0},orb)
+corner(orbDot,6)
+stroke(orbDot,K.card,2,0)
+
+local function showWin(v)
+    if St.shut then return end
+    St.visible=v
+    if v then
+        holder.Visible=true
+        win.GroupTransparency=1
+        uiScale.Scale=baseScale*0.92
+        tw(win,0.28,{GroupTransparency=0})
+        tw(uiScale,0.34,{Scale=baseScale},Enum.EasingStyle.Back)
+    else
+        tw(win,0.2,{GroupTransparency=1})
+        tw(uiScale,0.2,{Scale=baseScale*0.94},Enum.EasingStyle.Quart,Enum.EasingDirection.In)
+        task.delay(0.22,function()
+            if not St.visible and not St.shut then holder.Visible=false end
+        end)
+    end
+end
+dragify(orb,orb,function() showWin(not St.visible) end)
+ac(minB.MouseButton1Click:Connect(function() showWin(false) end))
+ac(UIS.InputBegan:Connect(function(i,gp)
+    if gp or St.shut then return end
+    if i.KeyCode==Enum.KeyCode.RightShift then showWin(not St.visible) end
+end))
+task.spawn(function()
+    while not St.shut do
+        if St.cur~="Idle" then
+            tw(orbRing,0.6,{Thickness=4,Transparency=0.5})
+            task.wait(0.6)
+            tw(orbRing,0.6,{Thickness=2,Transparency=0.1})
+            task.wait(0.6)
+        else
+            task.wait(0.5)
+        end
+    end
+end)
+
+-- status (used by macro tab, footer, orb)
+function X.setStatus(s,detail)
+    St.cur=s
+    local col=K.mt
+    if s=="Recording" then col=K.bad elseif s=="Playing" then col=K.ok elseif s~="Idle" then col=K.warn end
+    pcall(function()
+        if X.stRow and X.stRow.Parent then X.stRow.Visible=(s=="Playing") end
+        if X.sTxt and X.sTxt.Parent then
+            X.sTxt.Text=s
+            tw(X.sTxt,0.2,{TextColor3=(s=="Idle") and K.tx or col})
+            tw(X.sDot,0.2,{BackgroundColor3=col})
+        end
+        if X.sDet and X.sDet.Parent then
+            X.sDet.Text=detail or ((s=="Idle") and "Ready" or (s=="Recording" and "Capturing actions + exact costs" or "Running macro"))
+        end
+        tw(orbDot,0.2,{BackgroundColor3=col})
+        X.setDot(col)
+    end)
+end
+function X.setDetail(txt)
+    pcall(function() if X.sDet and X.sDet.Parent and X.sDet.Text~=txt then X.sDet.Text=txt end end)
+end
+function X.setStep(head,label,nextLabel)
+    pcall(function()
+        if not (X.stRow and X.stRow.Parent) then return end
+        X.stH.Text=head or ""
+        X.stA.Text=label or "-"
+        X.stB.Text="-"
+        X.stC.Text=nextLabel and ("Next  "..nextLabel) or ""
+    end)
+end
+function X.setPhase(txt)
+    pcall(function() if X.stB and X.stB.Parent and X.stB.Text~=txt then X.stB.Text=txt end end)
+end
+function X.setCount(n)
+    pcall(function() if X.sCnt and X.sCnt.Parent then X.sCnt.Text=tostring(n).." actions" end end)
+end
+
+-- ============================ GAME HELPERS ============================
+local R={}
+local function ens(k,f,n)
+    local c=R[k]
+    if c and c.Parent then return c end
+    local fo=RS:FindFirstChild(f)
+    if not fo then return nil end
+    local r=fo:FindFirstChild(n)
+    if r and (r:IsA("RemoteEvent") or r:IsA("RemoteFunction")) then
+        R[k]=r
+        return r
+    end
+end
+local fishEvent=nil
+local function getFishingEvent()
+    if fishEvent and fishEvent.Parent then return fishEvent end
+    local fo=RS:FindFirstChild("Fishing")
+    local rm=fo and fo:FindFirstChild("Remotes")
+    local ev=rm and rm:FindFirstChild("FishingEvent")
+    if ev and ev:IsA("RemoteEvent") then fishEvent=ev return ev end
+    return nil
+end
+
+local function visEl(d)
+    if not d.Visible then return false end
+    local p=d.Parent
+    while p do
+        if p:IsA("GuiObject") and not p.Visible then return false end
+        if p:IsA("ScreenGui") and not p.Enabled then return false end
+        p=p.Parent
+    end
+    return true
+end
+local function findBtn(word)
+    for _,d in ipairs(PG:GetDescendants()) do
+        if d:IsA("TextButton") or d:IsA("ImageButton") then
+            if visEl(d) then
+                local t
+                if d:IsA("TextButton") then
+                    t=d.Text
+                else
+                    local l=d:FindFirstChildWhichIsA("TextLabel",true)
+                    t=l and l.Text
+                end
+                t=tostring(t or ""):lower()
+                if #t<=18 and t:find(word,1,true) then return d end
+            end
+        end
+    end
+end
+local scan={t=0,btn=nil}
+local function endScreen()
+    local b=scan.btn
+    if b and b.Parent and visEl(b) then return true end
+    if tick()-scan.t>=0.8 then
+        scan.t=tick()
+        scan.btn=findBtn("replay")
+    end
+    b=scan.btn
+    return b~=nil and b.Parent~=nil and visEl(b)
+end
+local function resultNow()
+    local ws=RS:FindFirstChild("WaveState")
+    return ws and ws:GetAttribute("Result")
+end
+local function roundActive()
+    local r=resultNow()
+    if r=="Win" or r=="Lose" then return false end
+    return not endScreen()
+end
+
+function X.rfC()
+    pcall(function()
+        if X.tiles then
+            X.tiles[1].Text=tostring(C.P)
+            X.tiles[2].Text=tostring(C.U)
+            X.tiles[3].Text=tostring(C.S)
+        end
+        X.ftStat.Text=string.format("Place %d  |  Upgrade %d  |  Sell %d",C.P,C.U,C.S)
+    end)
+end
+
+local function resetRec()
+    rec.a={}
+    rec.n=1
+    rec.t={}
+    rec.k={}
+    rec.l=tick()
+    rec.pend={}
+    C.P=0 C.U=0 C.S=0
+    X.rfC()
+end
+
+-- ============================ CASH SYSTEM ============================
+-- Reads the real numeric cash value, measures exact costs from real drops.
+local JH={hist={},src="not detected",approx=false,get=nil,lastDetect=0,learned={},cands={},sampling=false}
+do
+    local MONEY_SUF={k=1e3,m=1e6,b=1e9,t=1e12,qa=1e15,qi=1e18,sx=1e21,sp=1e24,oc=1e27,no=1e30,dc=1e33}
+    local NAMEP={{"^cash$",100},{"^money$",95},{"^coins?$",90},{"^gold$",85},{"cash",60},{"money",55},{"coin",50},{"gold",45}}
+    local BAD={"max","total","earn","per","rate","gain","income","spent","best","mult","boost","limit","gem","premium","robux","rebirth","wins","kill","lifetime","goal","need","cost","price","time"}
+
+    local function scoreName(n)
+        n=tostring(n):lower()
+        for _,b in ipairs(BAD) do if n:find(b,1,true) then return 0 end end
+        for _,p in ipairs(NAMEP) do if n:find(p[1]) then return p[2] end end
+        return 0
+    end
+    function JH.parse(txt)
+        txt=tostring(txt or ""):lower()
+        txt=txt:gsub(",","")
+        local n,suf=txt:match("(%d+%.?%d*)%s*(%a*)")
+        n=tonumber(n)
+        if not n then return nil,false end
+        local abbreviated=false
+        if suf and suf~="" then
+            local m=MONEY_SUF[suf]
+            if m then n=n*m abbreviated=true end
+        end
+        return n,abbreviated
+    end
+    function JH.fmt(n)
+        n=tonumber(n) or 0
+        local t={{1e15,"Qa"},{1e12,"T"},{1e9,"B"},{1e6,"M"},{1e3,"K"}}
+        for _,v in ipairs(t) do
+            if n>=v[1] then return string.format("%.2f%s",n/v[1],v[2]) end
+        end
+        return tostring(math.floor(n))
+    end
+    function JH.full(n)
+        local s=string.format("%.0f",tonumber(n) or 0)
+        local r=s:reverse():gsub("(%d%d%d)","%1,"):reverse()
+        return (r:gsub("^,",""))
+    end
+
+    local function isNum(v) return v:IsA("IntValue") or v:IsA("NumberValue") end
+    function JH.collect()
+        local out={}
+        local function add(label,get,approx,score)
+            out[#out+1]={label=label,get=get,approx=approx,score=score}
+        end
+        local ls=PLR:FindFirstChild("leaderstats")
+        if ls then
+            for _,v in ipairs(ls:GetChildren()) do
+                if v:IsA("ValueBase") and isNum(v) then
+                    local s=scoreName(v.Name)
+                    if s>0 then add("leaderstats."..v.Name,function() return tonumber(v.Value) end,false,s+30) end
+                end
+            end
+        end
+        for k,v in pairs(PLR:GetAttributes()) do
+            if type(v)=="number" then
+                local s=scoreName(k)
+                if s>0 then add("attribute."..tostring(k),function() local x=PLR:GetAttribute(k) return type(x)=="number" and x or nil end,false,s+20) end
+            end
+        end
+        for _,v in ipairs(PLR:GetDescendants()) do
+            if v:IsA("ValueBase") and isNum(v) and v.Parent~=ls then
+                local s=scoreName(v.Name)
+                if s>0 then add("player."..v.Name,function() return tonumber(v.Value) end,false,s+10) end
+            end
+        end
+        for _,fo in ipairs(RS:GetChildren()) do
+            local pd=fo:FindFirstChild(PLR.Name) or fo:FindFirstChild(tostring(PLR.UserId))
+            if pd then
+                for _,v in ipairs(pd:GetDescendants()) do
+                    if v:IsA("ValueBase") and isNum(v) then
+                        local s=scoreName(v.Name)
+                        if s>0 then add("data."..fo.Name.."."..v.Name,function() return tonumber(v.Value) end,false,s+5) end
+                    end
+                end
+            end
+        end
+        local guiN=0
+        for _,d in ipairs(PG:GetDescendants()) do
+            if d:IsA("TextLabel") and guiN<12 then
+                local s=scoreName(d.Name)
+                local txt=tostring(d.Text)
+                if s>0 and JH.parse(txt) then
+                    guiN=guiN+1
+                    add("gui."..d.Name,function() local n,ab=JH.parse(d.Text) JH.approx=ab return n end,true,s-20)
+                elseif txt:match("^%s*%$%s*[%d%.,]+%s*%a*%s*$") and JH.parse(txt) then
+                    guiN=guiN+1
+                    add("gui."..d.Name.." (guess)",function() local n,ab=JH.parse(d.Text) JH.approx=ab return n end,true,5)
+                end
+            end
+        end
+        table.sort(out,function(a,b) return a.score>b.score end)
+        return out
+    end
+    function JH.detect()
+        JH.get=nil
+        JH.src="not detected"
+        JH.approx=false
+        local list=JH.collect()
+        JH.cands=list
+        local pick
+        if Cfg.csrc and Cfg.csrc~="" then
+            for _,c in ipairs(list) do if c.label==Cfg.csrc then pick=c break end end
+        end
+        pick=pick or list[1]
+        if not pick then return false end
+        local ok,v=pcall(pick.get)
+        if not ok or type(v)~="number" then return false end
+        JH.get=pick.get
+        JH.src=pick.label
+        JH.approx=pick.approx
+        return true
+    end
+    function JH.cash()
+        if not JH.get and tick()-JH.lastDetect>8 then
+            JH.lastDetect=tick()
+            JH.detect()
+        end
+        if not JH.get then return nil end
+        local ok,v=pcall(JH.get)
+        if ok and type(v)=="number" then return v end
+        JH.get=nil
+        return nil
+    end
+    function JH.wave()
+        local ws=RS:FindFirstChild("WaveState")
+        local w=ws and ws:GetAttribute("CurrentWave")
+        if type(w)=="number" then return w end
+        return nil
+    end
+    -- total money that LEFT the wallet between t0 and t1 (income is ignored)
+    function JH.spent(t0,t1)
+        local h=JH.hist
+        local prev,sum=nil,0
+        for i=1,#h do
+            local e=h[i]
+            if e[1]<t0 then
+                prev=e[2]
+            elseif e[1]<=t1 then
+                if prev and e[2]<prev then sum=sum+(prev-e[2]) end
+                prev=e[2]
+            end
+        end
+        return sum
+    end
+    function JH.waitCash(need,okf,tickf,fast)
+        while okf() do
+            local c=JH.cash()
+            if not c or c>=need then return true end
+            if tickf then tickf(c) end
+            task.wait()
+        end
+        return false
+    end
+    function JH.waitDrop(c0,to)
+        local t=tick()
+        while tick()-t<to do
+            local c=JH.cash()
+            if c and c0 and c<c0 then return true end
+            task.wait()
+        end
+        return false
+    end
+    -- after a successful purchase: read the real drop and remember it
+    function JH.confirm(key,c0,t0,need)
+        if not c0 then return 0 end
+        JH.waitDrop(c0,0.5)
+        task.wait()
+        local sp=JH.spent(t0-0.05,tick())
+        if sp>0 and (need<=0 or sp<=need*3) then JH.learned[key]=sp end
+        return sp
+    end
+    -- sampler: stores every change of the cash value (once per frame)
+    ac(RUN.Heartbeat:Connect(function()
+        JH.sampling=rec.active or rec.finishing or St.playing
+        if not JH.sampling then
+            if #JH.hist>0 then JH.hist={} end
+            return
+        end
+        local c=JH.cash()
+        if not c then return end
+        local h,now=JH.hist,tick()
+        local last=h[#h]
+        if not last or last[2]~=c then h[#h+1]={now,c} end
+        while #h>1 and now-h[1][1]>8 do table.remove(h,1) end
+    end))
+end
+
+-- ============================ AUTO FISH ============================
+local function stopAutoFish()
+    St.fish=false
+    St.fsess=St.fsess+1
+end
+local function startAutoFish()
+    if St.shut or St.fish then return end
+    St.fish=true
+    St.fsess=St.fsess+1
+    local my=St.fsess
+    task.spawn(function()
+        local function ok() return not St.shut and St.fish and St.fsess==my end
+        while ok() do
+            local Event=getFishingEvent()
+            if not Event then
+                task.wait(0.5)
+            else
+                local okC,Character=pcall(function() return PLR.Character or PLR.CharacterAdded:Wait() end)
+                local Root=okC and Character and Character:WaitForChild("HumanoidRootPart",5)
+                if not Root then
+                    task.wait(0.5)
+                else
+                    local CastPosition
+                    local fp=Cfg.fpos
+                    if type(fp)=="table" and tonumber(fp[1]) and tonumber(fp[2]) and tonumber(fp[3]) then
+                        CastPosition=Vector3.new(fp[1],fp[2],fp[3])   -- spot the player picked
+                    else
+                        CastPosition=Root.Position+Root.CFrame.LookVector*10+Vector3.new(0,-8,0)
+                    end
+                    pcall(function() Event:FireServer("Cast",{Position=CastPosition}) end)
+                    task.wait(0.01)
+                    if not ok() then break end
+                    local HoldStart=workspace:GetServerTimeNow()
+                    pcall(function() Event:FireServer("LuckHold",{ClickTime=HoldStart}) end)
+                    task.wait(0.01)
+                    if not ok() then break end
+                    pcall(function()
+                        if type(firesignal)=="function" and Event.OnClientEvent then
+                            firesignal(Event.OnClientEvent,"LuckHeld",{HoldStart=HoldStart,Speed=4})
+                        end
+                    end)
+                    task.wait(0.01)
+                    if not ok() then break end
+                    pcall(function() Event:FireServer("LuckRelease",{ClickTime=workspace:GetServerTimeNow()}) end)
+                    task.wait(0.01)
+                    for Index=1,15 do
+                        if not ok() then break end
+                        pcall(function() Event:FireServer("Hit",{Index=Index}) end)
+                        task.wait(0.01)
+                    end
+                    task.wait(0.1)
+                end
+            end
+        end
+    end)
+end
+
+-- ============================ TOWER TRACKING ============================
+local function snapTowers()
+    local s={}
+    local tw_=workspace:FindFirstChild("Towers")
+    if tw_ then for _,x in ipairs(tw_:GetChildren()) do s[x]=true end end
+    return s
+end
+-- nearest tower that did NOT exist in `snap` and is not claimed yet
+local function claimNew(snap,pos,claimed)
+    local tw_=workspace:FindFirstChild("Towers")
+    if not tw_ then return nil end
+    local best,bd
+    for _,x in ipairs(tw_:GetChildren()) do
+        if not snap[x] and not claimed[x] then
+            local ok,q=pcall(function() return x:GetPivot().Position end)
+            if ok and q then
+                local d=(Vector3.new(q.X,0,q.Z)-Vector3.new(pos.X,0,pos.Z)).Magnitude
+                if d<40 and (not bd or d<bd) then best,bd=x,d end
+            end
+        end
+    end
+    return best
+end
+
+-- ============================ RECORDER ============================
+local HR={PL=nil,UP=nil,SE=nil,SK=nil,SP=nil}
+local function refreshHR()
+    HR.PL=ens("p","RemoteFunctions","PlaceTower")
+    HR.UP=ens("u","RemoteFunctions","UpgradeTower")
+    HR.SE=ens("s","RemoteFunctions","SellTower")
+    HR.SK=ens("w","RemoteEvents","SkipWaveVote")
+    HR.SP=ens("g","RemoteEvents","SetGameSpeed")
+end
+refreshHR()
+task.spawn(function()
+    while not St.shut do
+        if rec.active then refreshHR() end
+        task.wait(5)
+    end
+end)
+
+-- measure the exact cost of an action from the real cash drop
+local function scheduleCost(act,w0,w1,startT)
+    local e={act=act,s=startT}
+    rec.pend[#rec.pend+1]=e
+    local mine=rec.pend
+    task.delay(math.max(0.05,w1-tick()+0.15),function()
+        local hi=w1
+        for _,o in ipairs(mine) do
+            if o~=e and o.s and e.s and o.s>e.s and o.s<hi then hi=o.s end
+        end
+        local c=JH.spent(w0,hi)
+        if c>0 then
+            act.c=math.floor(c+0.5)
+        elseif act.t=="U" and X.hookOk and JH.get and not JH.approx and JH.cash() then
+            act.bad=true   -- no money left the wallet -> the upgrade was rejected
+        end
+        e.done=true
+    end)
+end
+local function pushAct(act,w0,w1,startT)
+    rec.a[#rec.a+1]=act
+    act.w=JH.wave()
+    if act.t=="P" or act.t=="U" then scheduleCost(act,w0,w1,startT) end
+    X.setCount(#rec.a)
+end
+
+-- identify which remote was called (reference first, then by name)
+local function classify(self)
+    if typeof(self)~="Instance" then return nil end
+    if self==HR.PL then return "PL" elseif self==HR.UP then return "UP" elseif self==HR.SE then return "SE"
+    elseif self==HR.SK then return "SK" elseif self==HR.SP then return "SP" end
+    local cn,nm=self.ClassName,self.Name
+    if cn=="RemoteFunction" then
+        if nm=="PlaceTower" then return "PL" elseif nm=="UpgradeTower" then return "UP" elseif nm=="SellTower" then return "SE" end
+    elseif cn=="RemoteEvent" then
+        if nm=="SkipWaveVote" then return "SK" elseif nm=="SetGameSpeed" then return "SP" elseif nm=="FishingEvent" then return "FI" end
+    end
+    return nil
+end
+
+-- runs deferred (after the real call went out), never inside the hook
+local function onRemote(kind,args,t0,snap)
+    if kind=="FI" then
+        if St.pick and args[1]=="Cast" and X.onCastPicked then
+            local p=args[2]
+            if type(p)=="table" then p=p.Position end
+            if typeof(p)=="Vector3" then X.onCastPicked(p) end
+        end
+        return
+    end
+    if not rec.active then return end
+    local tk=t0
+    local d=tk-(rec.l or tk)
+    if kind=="PL" then
+        local n,cf
+        for i=1,(args.n or #args) do
+            local v=args[i]
+            if not n and type(v)=="string" then n=v end
+            if not cf and typeof(v)=="CFrame" then cf=v end
+        end
+        if not n or not cf then return end
+        local id=rec.n
+        rec.n=id+1
+        rec.l=tk
+        local act={t="P",n=n,p={cf.Position.X,cf.Position.Y,cf.Position.Z},i=id,d=d}
+        pushAct(act,t0-0.05,t0+0.9,t0)
+        task.spawn(function()
+            local t1=tick()
+            while tick()-t1<3 and not St.shut do
+                local inst=claimNew(snap or {},cf.Position,rec.k)
+                if inst then
+                    rec.t[id]=inst
+                    rec.k[inst]=id
+                    C.P=C.P+1
+                    X.rfC()
+                    return
+                end
+                task.wait(0.05)
+            end
+            act.bad=true   -- no tower appeared -> placement was rejected
+        end)
+    elseif kind=="UP" then
+        local id=rec.k[args[1]]
+        if id then
+            rec.l=tk
+            C.U=C.U+1 X.rfC()
+            pushAct({t="U",i=id,d=d},t0-0.05,t0+0.9,t0)
+        end
+    elseif kind=="SE" then
+        local inst=args[1]
+        local id=rec.k[inst]
+        if id then
+            rec.l=tk
+            C.S=C.S+1 X.rfC()
+            pushAct({t="S",i=id,d=d},t0,t0,t0)
+            rec.t[id]=nil
+            rec.k[inst]=nil
+        end
+    elseif kind=="SK" then
+        rec.l=tk
+        pushAct({t="W",v=(type(args[1])=="number") and args[1] or nil,d=d},t0,t0,t0)
+    elseif kind=="SP" then
+        rec.l=tk
+        pushAct({t="G",v=args[1],d=d},t0,t0,t0)
+    end
+end
+
+-- IMPORTANT: the hook only OBSERVES. The real call is always a plain tail call,
+-- so it can yield normally, and the namecall method is restored first.
+local function hookBody(old,self,...)
+    if St.shut or not (rec.active or St.pick) then return old(self,...) end
+    local m=getnamecallmethod and getnamecallmethod() or ""
+    if m~="InvokeServer" and m~="FireServer" then return old(self,...) end
+    local ok,kind=pcall(classify,self)
+    if ok and kind then
+        local args=table.pack(...)
+        local t0=tick()
+        pcall(function()
+            local snap=(kind=="PL") and snapTowers() or nil
+            task.defer(onRemote,kind,args,t0,snap)
+            rec.hits=rec.hits+1
+        end)
+        if setnamecallmethod then pcall(setnamecallmethod,m) end
+    end
+    return old(self,...)
+end
+
+local HOOK_MODE,HOOK_OK="none",false
+do
+    if type(hookmetamethod)=="function" and type(newcclosure)=="function" then
+        HOOK_MODE="hookmetamethod"
+        HOOK_OK=pcall(function()
+            local old
+            old=hookmetamethod(game,"__namecall",newcclosure(function(self,...)
+                return hookBody(old,self,...)
+            end))
+        end)
+    elseif type(getrawmetatable)=="function" and type(setreadonly)=="function" and type(newcclosure)=="function" then
+        HOOK_MODE="getrawmetatable"
+        HOOK_OK=pcall(function()
+            local mt=getrawmetatable(game)
+            local old=mt.__namecall
+            setreadonly(mt,false)
+            mt.__namecall=newcclosure(function(self,...)
+                return hookBody(old,self,...)
+            end)
+            setreadonly(mt,true)
+        end)
+    end
+end
+X.hookOk=HOOK_OK
+print("[JET HUB] hook: "..(HOOK_OK and HOOK_MODE or "none (passive mode)"))
+
+-- passive mode (no hooking API): watch the Towers folder
+local function clearPassive()
+    for _,c in ipairs(passiveConns) do pcall(function() c:Disconnect() end) end
+    passiveConns={}
+end
+local function getTowerName(t)
+    for _,a in ipairs({"UnitName","TowerName","Type","Unit","UnitType","Tower"}) do
+        local v=t:GetAttribute(a)
+        if type(v)=="string" and v~="" then return v end
+    end
+    for _,c in ipairs(t:GetChildren()) do
+        if c:IsA("StringValue") and (c.Name:lower():find("type") or c.Name:lower():find("name")) and c.Value~="" then
+            return c.Value
+        end
+    end
+    return t.Name
+end
+local function watchTower(tower,id)
+    passiveConns[#passiveConns+1]=tower.AttributeChanged:Connect(function(attr)
+        if not rec.active or St.shut then return end
+        local l=attr:lower()
+        if l=="level" or l=="tier" or l=="upgrade" or l=="rank" or l=="upgraded" then
+            C.U=C.U+1 X.rfC()
+            local tk=tick()
+            local d=tk-(rec.l or tk)
+            rec.l=tk
+            pushAct({t="U",i=id,d=d},tk-1.0,tk+0.3,nil)
+        end
+    end)
+    passiveConns[#passiveConns+1]=tower.Destroying:Connect(function()
+        if not rec.active or St.shut then return end
+        if rec.k[tower]~=id then return end
+        if endScreen() then return end
+        C.S=C.S+1 X.rfC()
+        local tk=tick()
+        local d=tk-(rec.l or tk)
+        rec.l=tk
+        pushAct({t="S",i=id,d=d},tk,tk,nil)
+        rec.t[id]=nil
+        rec.k[tower]=nil
+    end)
+end
+local function onTowerAdded(tower)
+    if not rec.active or St.shut then return end
+    if knownTowers[tower] then return end
+    knownTowers[tower]=true
+    local ok,cf=pcall(function() return tower:GetPivot() end)
+    if not ok or not cf then return end
+    C.P=C.P+1 X.rfC()
+    local id=rec.n
+    rec.n=id+1
+    local tk=tick()
+    local d=tk-(rec.l or tk)
+    rec.l=tk
+    rec.t[id]=tower
+    rec.k[tower]=id
+    pushAct({t="P",n=getTowerName(tower),p={cf.Position.X,cf.Position.Y,cf.Position.Z},i=id,d=d},tk-1.0,tk+0.3,nil)
+    watchTower(tower,id)
+end
+local function startPassive()
+    knownTowers={}
+    clearPassive()
+    local tw_=workspace:FindFirstChild("Towers")
+    if tw_ then
+        for _,t in ipairs(tw_:GetChildren()) do knownTowers[t]=true end
+        passiveConns[#passiveConns+1]=tw_.ChildAdded:Connect(onTowerAdded)
+    else
+        local wc
+        wc=workspace.ChildAdded:Connect(function(child)
+            if St.shut or child.Name~="Towers" then return end
+            if wc then wc:Disconnect() end
+            for _,t in ipairs(child:GetChildren()) do knownTowers[t]=true end
+            passiveConns[#passiveConns+1]=child.ChildAdded:Connect(onTowerAdded)
+        end)
+        passiveConns[#passiveConns+1]=wc
+    end
+end
+
+local function stopRecording()
+    if not rec.active then
+        set("rec",false)
+        X.setStatus("Idle")
+        return
+    end
+    rec.active=false
+    rec.finishing=true
+    set("rec",false)
+    if not HOOK_OK then clearPassive() end
+    X.setStatus("Recording","Measuring exact costs...")
+    task.spawn(function()
+        local t=tick()
+        while tick()-t<3 do
+            local all=true
+            for _,e in ipairs(rec.pend) do if not e.done then all=false break end end
+            if all then break end
+            task.wait(0.1)
+        end
+        local out={}
+        for _,a in ipairs(rec.a) do if not a.bad then out[#out+1]=a end end
+        if #out>0 and Cfg.sel~="" then
+            local miss=0
+            for _,a in ipairs(out) do if (a.t=="P" or a.t=="U") and not a.c then miss=miss+1 end end
+            if wj(FO..Cfg.sel..".json",out) then
+                if JH.get==nil then
+                    N("Saved "..#out.." steps (cash not found - timing mode)","warn")
+                elseif miss>0 then
+                    N("Saved "..#out.." steps ("..miss.." costs unknown, will be learned)","warn")
+                else
+                    N("Saved "..#out.." steps - every cost captured","ok")
+                end
+            else
+                N("Save failed (writefile unsupported?)","bad")
+            end
+        else
+            N("Nothing recorded (hook="..HOOK_MODE.." hits="..rec.hits..")","warn")
+        end
+        rec.finishing=false
+        resetRec()
+        X.setCount(0)
+        X.setStatus("Idle")
+    end)
+end
+
+-- ============================ PLAYBACK ============================
+local function stopPlayback()
+    St.playing=false
+    St.psess=St.psess+1
+    X.setStatus("Idle")
+    set("pl",false)
+end
+
+local function startPlayback()
+    if St.shut or St.playing then return end
+    St.psess=St.psess+1
+    local my=St.psess
+    St.playing=true
+    X.setStatus("Playing","Starting...")
+    X.setStep("Starting macro","Preparing...",nil)
+    task.spawn(function()
+        local function alive() return St.playing and St.psess==my and not St.shut end
+        local roundDetail=nil
+        local lastUI,shownWait=0,false
+        -- shows "waiting for cash $X (have $Y, short $Z)" in the Status card
+        local function waitUI(need,c)
+            local now=tick()
+            if now-lastUI<0.1 then return end
+            lastUI=now
+            shownWait=true
+            local msg=string.format("Waiting for cash $%s  (have $%s  short $%s)",JH.full(need),JH.full(c),JH.full(math.max(0,need-c)))
+            X.setPhase(msg)
+            X.setDetail(msg)
+        end
+        local function restoreDetail()
+            if shownWait then
+                shownWait=false
+                if roundDetail then X.setDetail(roundDetail) end
+            end
+        end
+
+        local function waitNextRound()
+            local t=tick()
+            while alive() and roundActive() and tick()-t<1800 do task.wait(0.5) end
+            t=tick()
+            while alive() and not roundActive() and tick()-t<600 do task.wait(0.5) end
+            if alive() then task.wait(1) end
+        end
+
+        -- ---------- labels / status ----------
+        local function actLabel(a,names)
+            if not a then return "" end
+            if a.t=="P" then return "Place("..tostring(a.n)..")"
+            elseif a.t=="U" then return "Upgrade("..tostring(names[a.i] or ("#"..tostring(a.i)))..")"
+            elseif a.t=="S" then return "Sell("..tostring(names[a.i] or ("#"..tostring(a.i)))..")"
+            elseif a.t=="W" then return "Skip wave()"
+            else return "Speed("..tostring(a.v)..")" end
+        end
+
+        -- ---------- cost correction ----------
+        -- step used when the learned cost was too low: exactly 1 for normal prices,
+        -- ~0.1% for huge prices (the real drop is measured afterwards anyway)
+        local function stepFor(n)
+            if n<10000 then return 1 end
+            return 10^(math.floor(math.log10(n))-3)
+        end
+        -- write the corrected price straight back into the macro file
+        local function fixCost(ctx,idx,a,real)
+            real=math.floor((tonumber(real) or 0)+0.5)
+            if real<=0 or a.c==real then return end
+            local old=a.c
+            a.c=real
+            JH.learned[Cfg.sel..":"..idx]=real
+            wj(FO..Cfg.sel..".json",ctx.data)
+            N(string.format("Fixed macro cost at step %d: %s -> %s",idx,old and JH.full(old) or "?",JH.full(real)),"ok")
+        end
+        local function afterBuy(ctx,idx,a,sp,need,corrected)
+            if JH.approx then return end   -- GUI text source is only approximate
+            local real=(sp and sp>0) and sp or (corrected and need) or nil
+            if real then fixCost(ctx,idx,a,real) end
+        end
+
+        local function doPlace(a,idx,ctx,useCash,runOk)
+            local PL=ens("p","RemoteFunctions","PlaceTower")
+            if not PL then N("PlaceTower remote not found","bad") return end
+            local cf=CFrame.new(a.p[1],a.p[2],a.p[3])
+            local key=Cfg.sel..":"..idx
+            local need=useCash and (JH.learned[key] or a.c or 0) or 0
+            local lim=(a.c and a.c>0) and a.c*3 or math.huge
+            local tries,placed,hard,corrected=0,false,0,false
+            local maxTry=useCash and 400 or 15
+            local deadline=tick()+240
+            while runOk() and not placed and tries<maxTry and tick()<deadline do
+                if useCash and need>0 then
+                    local okw=JH.waitCash(need,runOk,function(c) waitUI(need,c) end,corrected)
+                    restoreDetail()
+                    if not okw then return end
+                end
+                tries=tries+1
+                X.setPhase(corrected and string.format("Trying price %s ...",JH.full(need)) or ("Placing("..tostring(a.n)..")"))
+                local c0,t0=JH.cash(),tick()
+                local snap=snapTowers()
+                local okc,res=pcall(function() return PL:InvokeServer(a.n,cf) end)
+                local inst
+                if okc and res~=false then
+                    local t1=tick()
+                    while tick()-t1<4 and runOk() do
+                        inst=claimNew(snap,cf.Position,ctx.k)
+                        if inst then break end
+                        task.wait(0.05)
+                    end
+                end
+                if inst then
+                    ctx.t[a.i]=inst
+                    ctx.k[inst]=a.i
+                    placed=true
+                    C.P=C.P+1 X.rfC()
+                    X.setPhase("Placed OK")
+                    if useCash then
+                        local sp=JH.confirm(key,c0,t0,need)
+                        afterBuy(ctx,idx,a,sp,need,corrected)
+                    end
+                else
+                    local c=JH.cash()
+                    if useCash and c then
+                        if a.c and c>=a.c*1.5 then
+                            hard=hard+1
+                            if hard>=4 then break end
+                        end
+                        -- bought nothing although we thought the cash was enough:
+                        -- the real price is higher -> raise it by a tiny step and retry fast
+                        need=math.max(need,c)+stepFor(math.max(need,c,1))
+                        corrected=true
+                        if need>lim then break end
+                        task.wait()
+                    else
+                        task.wait(0.3)
+                    end
+                end
+            end
+            if not placed and runOk() then
+                warn("[JET HUB] could not place "..tostring(a.n).." (step "..idx..")")
+                N("Could not place "..tostring(a.n).." (step "..idx..")","warn")
+            end
+        end
+
+        local function doUpgrade(a,idx,ctx,useCash,runOk)
+            local UP=ens("u","RemoteFunctions","UpgradeTower")
+            if not UP then N("UpgradeTower remote not found","bad") return end
+            local inst=ctx.t[a.i]
+            if not inst or not inst.Parent then
+                warn("[JET HUB] upgrade skipped, tower #"..tostring(a.i).." is missing (step "..idx..")")
+                X.setPhase("Skipped - no unit to upgrade")
+                return
+            end
+            local key=Cfg.sel..":"..idx
+            local need=useCash and (JH.learned[key] or a.c or 0) or 0
+            local lim=(a.c and a.c>0) and a.c*3 or math.huge
+            local tries,done,hard,corrected=0,false,0,false
+            local deadline=tick()+180
+            while runOk() and not done and tries<(useCash and 400 or 30) and inst.Parent and tick()<deadline do
+                if useCash and need>0 then
+                    local okw=JH.waitCash(need,runOk,function(c) waitUI(need,c) end,corrected)
+                    restoreDetail()
+                    if not okw then return end
+                end
+                tries=tries+1
+                X.setPhase(corrected and string.format("Trying price %s ...",JH.full(need)) or ("Upgrading(#"..tostring(a.i)..")"))
+                local c0,t0=JH.cash(),tick()
+                local okc,res=pcall(function() return UP:InvokeServer(inst) end)
+                if okc and res~=false then
+                    if res==true or not useCash or need<=0 or not c0 then
+                        done=true
+                    else
+                        done=JH.waitDrop(c0,0.4)
+                    end
+                end
+                if done then
+                    C.U=C.U+1 X.rfC()
+                    X.setPhase("Upgraded OK")
+                    if useCash then
+                        local sp=JH.confirm(key,c0,t0,need)
+                        afterBuy(ctx,idx,a,sp,need,corrected)
+                    end
+                else
+                    local c=JH.cash()
+                    if useCash and c then
+                        if a.c and c>=a.c*1.5 then
+                            hard=hard+1
+                            if hard>=4 then break end
+                        end
+                        need=math.max(need,c)+stepFor(math.max(need,c,1))
+                        corrected=true
+                        if need>lim then break end
+                        task.wait()
+                    else
+                        task.wait(0.25)
+                    end
+                end
+            end
+        end
+
+        local function doAction(a,idx,ctx,useCash,runOk)
+            local total=#ctx.data
+            X.setStep(string.format("Step %d / %d",idx,total),idx..": "..actLabel(a,ctx.names),
+                ctx.data[idx+1] and ((idx+1)..": "..actLabel(ctx.data[idx+1],ctx.names)) or nil)
+            -- wait for the wave this action was recorded in
+            if useCash and Cfg.nw~=false then
+                -- ignore wave and time: act as soon as the cash is enough
+            elseif useCash and a.w~=nil and JH.wave()~=nil then
+                while runOk() do
+                    local cw=JH.wave()
+                    if not cw or cw>=a.w then break end
+                    X.setPhase(string.format("Waiting wave(%d)  now wave %d",a.w,cw))
+                    task.wait(0.1)
+                end
+            elseif (a.d or 0)>0 then
+                X.setPhase(string.format("Waiting(%.1fs)",a.d))
+                local t0=tick()
+                while tick()-t0<a.d and runOk() do task.wait(0.05) end
+            end
+            if not runOk() then return end
+            if a.t=="P" then
+                doPlace(a,idx,ctx,useCash,runOk)
+            elseif a.t=="U" then
+                doUpgrade(a,idx,ctx,useCash,runOk)
+            elseif a.t=="S" then
+                X.setPhase("Selling...")
+                local SE=ens("s","RemoteFunctions","SellTower")
+                local inst=ctx.t[a.i]
+                if SE and inst and inst.Parent then
+                    pcall(function() SE:InvokeServer(inst) end)
+                    C.S=C.S+1 X.rfC()
+                    ctx.t[a.i]=nil
+                    ctx.k[inst]=nil
+                end
+                X.setPhase("Sold OK")
+            elseif a.t=="W" then
+                local SK=ens("w","RemoteEvents","SkipWaveVote")
+                if SK then pcall(function() SK:FireServer(a.v or 1) end) end
+                X.setPhase("Wave skipped")
+            elseif a.t=="G" then
+                local SP=ens("g","RemoteEvents","SetGameSpeed")
+                if SP then pcall(function() SP:FireServer(a.v) end) end
+                X.setPhase("Speed set")
+            end
+        end
+
+        local round=0
+        while alive() do
+            local data=loadMacro(Cfg.sel)
+            if not data or #data==0 then
+                N("Macro is empty - record it first","bad")
+                break
+            end
+            if not roundActive() then
+                X.setStatus("Playing","Waiting for the round to start...")
+                X.setStep("Waiting for round","Waiting for the round to start...",nil)
+                local t0=tick()
+                while alive() and not roundActive() and tick()-t0<600 do task.wait(0.4) end
+                if not alive() then break end
+                task.wait(0.6)
+            end
+            round=round+1
+            C.P=0 C.U=0 C.S=0 X.rfC()
+            local names={}
+            for _,x in ipairs(data) do if x.t=="P" then names[x.i]=x.n end end
+            local ctx={t={},k={},data=data,names=names}
+            local useCash=(Cfg.cm~=false) and JH.cash()~=nil
+            roundDetail=string.format("Round %d | %d steps | %s",round,#data,useCash and ("cash mode ("..JH.src..")") or "timing mode")
+            X.setStatus("Playing",roundDetail)
+            local offSince
+            local function runOk()
+                if not alive() then return false end
+                if roundActive() then offSince=nil return true end
+                offSince=offSince or tick()
+                return tick()-offSince<1.5
+            end
+            for idx,a in ipairs(data) do
+                if not runOk() then break end
+                local ok,err=pcall(doAction,a,idx,ctx,useCash,runOk)
+                if not ok then
+                    warn("[JET HUB] step "..idx.." error: "..tostring(err))
+                end
+            end
+            if not alive() then break end
+            X.setStatus("Playing","Macro finished - waiting for next round")
+            X.setPhase("Macro finished - waiting for next round")
+            waitNextRound()
+        end
+        if St.psess==my then
+            St.playing=false
+            St.psess=St.psess+1
+            X.setStatus("Idle")
+            set("pl",false)
+            if X.pToggle and X.pToggle.GetValue() then X.pToggle.SetValue(false) end
+        end
+    end)
+end
+
+-- ============================ AUTOMATION LOOPS ============================
+local function invokeSummon(a)
+    local fo=RS:FindFirstChild("RemoteFunctions")
+    local ev=fo and fo:FindFirstChild("SummonUnits")
+    if not ev or not ev:IsA("RemoteFunction") then return false end
+    return pcall(function() ev:InvokeServer(a) end)
+end
+task.spawn(function()
+    while not St.shut do
+        if Cfg.s10 then invokeSummon(10) task.wait(1) else task.wait(0.5) end
+    end
+end)
+task.spawn(function()
+    while not St.shut do
+        if Cfg.s1 then invokeSummon(1) task.wait(1) else task.wait(0.5) end
+    end
+end)
+task.spawn(function()
+    while not St.shut do
+        if Cfg.s25 then invokeSummon(25) task.wait(0.5) else task.wait(0.5) end
+    end
+end)
+task.spawn(function()
+    while not St.shut do
+        if Cfg.spn then
+            local fo=RS:FindFirstChild("RemoteFunctions")
+            local ev=fo and fo:FindFirstChild("SpinWheel")
+            if ev and ev:IsA("RemoteFunction") then pcall(function() ev:InvokeServer() end) end
+            task.wait(0.5)
+        else
+            task.wait(0.2)
+        end
+    end
+end)
+task.spawn(function()
+    while not St.shut do
+        if Cfg.oc then
+            local fo=RS:FindFirstChild("RemoteFunctions")
+            local ev=fo and fo:FindFirstChild("OpenCrate")
+            if ev and ev:IsA("RemoteFunction") then pcall(function() ev:InvokeServer(Cfg.crate or "Free",1) end) end
+            task.wait(1)
+        else
+            task.wait(0.3)
+        end
+    end
+end)
+local lbLoop=false
+local function startLB()
+    if St.shut or lbLoop then return end
+    lbLoop=true
+    task.spawn(function()
+        while not St.shut and Cfg.lb do
+            local tl=RS:FindFirstChild("ReturnToLobby")
+            if tl and tl:IsA("RemoteEvent") then pcall(function() tl:FireServer() end) end
+            task.wait(1)
+        end
+        lbLoop=false
+    end)
+end
+local rpL=false
+local function startRP()
+    if St.shut or rpL then return end
+    rpL=true
+    task.spawn(function()
+        while not St.shut and Cfg.rp do
+            local re=RS:FindFirstChild("RemoteEvents")
+            local rv=re and re:FindFirstChild("ReplayVote")
+            if rv then pcall(function() rv:FireServer() end) end
+            task.wait(1)
+        end
+        rpL=false
+    end)
+end
+-- restart the recording when the round ends
+task.spawn(function()
+    local was=false
+    while not St.shut do
+        local now=endScreen()
+        if now and not was and rec.active then
+            resetRec()
+            X.setCount(0)
+            N("Round ended - recording restarted","warn")
+        end
+        was=now
+        task.wait(1)
+    end
+end)
+local lastW=nil
+local function setVis(on)
+    pcall(function()
+        local b=PG.MainGameUI.UpSide.InfoDop.AutoSkip
+        for _,v in ipairs(b:GetDescendants()) do
+            if v:IsA("UIGradient") then
+                if v.Name=="AutoOff" then v.Enabled=not on
+                elseif v.Name=="AutoOn" then v.Enabled=on end
+            end
+        end
+    end)
+end
+task.spawn(function()
+    while not St.shut do
+        if Cfg.sk then
+            local ws=RS:FindFirstChild("WaveState")
+            if ws then
+                local w=ws:GetAttribute("CurrentWave")
+                local c=ws:GetAttribute("CanSkipWave")
+                local r=ws:GetAttribute("Result")
+                if c==true and r~="Win" and r~="Lose" and lastW~=w then
+                    lastW=w
+                    local skR=ens("w","RemoteEvents","SkipWaveVote")
+                    if skR then pcall(function() skR:FireServer(w) end) end
+                end
+            end
+        end
+        task.wait(0.5)
+    end
+end)
+
+-- ============================ SHUTDOWN / CLOSE DIALOG ============================
+local function shutdownScript()
+    if X.down then return end
+    X.down=true
+    St.shut=true
+    St.playing=false
+    St.psess=St.psess+1
+    St.fish=false
+    St.fsess=St.fsess+1
+    rec.active=false
+    rec.finishing=false
+    pcall(cleanConns)
+    pcall(clearPassive)
+    pcall(function() sg:Destroy() end)
+    print("[JET HUB] shutdown complete")
+end
+
+local dlg
+local function askClose()
+    if St.shut or dlg then return end
+    local scrim=mk("TextButton",{Size=UDim2.fromScale(1,1),BackgroundColor3=Color3.new(0,0,0),BackgroundTransparency=1,Text="",AutoButtonColor=false,ZIndex=90},sg)
+    dlg=scrim
+    local d=mk("CanvasGroup",{Size=UDim2.fromOffset(300,150),AnchorPoint=Vector2.new(0.5,0.5),Position=UDim2.fromScale(0.5,0.5),BackgroundColor3=K.card,BorderSizePixel=0,GroupTransparency=1},scrim)
+    corner(d,14)
+    stroke(d,K.line,1,0.1)
+    local ds=mk("UIScale",{Scale=0.9},d)
+    local bar=mk("Frame",{Size=UDim2.new(1,0,0,3),BorderSizePixel=0},d)
+    th(bar,"BackgroundColor3")
+    T(d,"Close "..HUB_FULL.."?",15,K.tx,Enum.Font.GothamBold,{Position=UDim2.fromOffset(18,18),Size=UDim2.new(1,-36,0,20)})
+    T(d,"Recording and macro playback will stop.",11,K.sb,Enum.Font.Gotham,{Position=UDim2.fromOffset(18,44),Size=UDim2.new(1,-36,0,32),TextWrapped=true,TextYAlignment=Enum.TextYAlignment.Top})
+    local nb=mk("TextButton",{Size=UDim2.new(0.5,-24,0,34),Position=UDim2.new(0,18,1,-52),BackgroundColor3=K.el,BorderSizePixel=0,Font=Enum.Font.GothamBold,TextSize=12,TextColor3=K.tx,Text="Cancel",AutoButtonColor=false},d)
+    corner(nb,9)
+    local yb=mk("TextButton",{Size=UDim2.new(0.5,-24,0,34),Position=UDim2.new(0.5,6,1,-52),BackgroundColor3=Color3.fromRGB(200,70,76),BorderSizePixel=0,Font=Enum.Font.GothamBold,TextSize=12,TextColor3=WHITE,Text="Close",AutoButtonColor=false},d)
+    corner(yb,9)
+    tw(scrim,0.22,{BackgroundTransparency=0.45})
+    tw(d,0.22,{GroupTransparency=0})
+    tw(ds,0.3,{Scale=1},Enum.EasingStyle.Back)
+    local function kill()
+        local s=scrim
+        dlg=nil
+        tw(s,0.18,{BackgroundTransparency=1})
+        tw(d,0.18,{GroupTransparency=1})
+        task.delay(0.22,function() pcall(function() s:Destroy() end) end)
+    end
+    nb.MouseButton1Click:Connect(kill)
+    yb.MouseButton1Click:Connect(function()
+        St.playing=false
+        rec.active=false
+        St.fish=false
+        pcall(function()
+            TS:Create(win,TweenInfo.new(0.28),{GroupTransparency=1}):Play()
+            TS:Create(d,TweenInfo.new(0.2),{GroupTransparency=1}):Play()
+            TS:Create(scrim,TweenInfo.new(0.2),{BackgroundTransparency=1}):Play()
+            TS:Create(orb,TweenInfo.new(0.2),{BackgroundTransparency=1}):Play()
+        end)
+        task.delay(0.32,shutdownScript)
+    end)
+end
+ac(xb.MouseButton1Click:Connect(askClose))
+
+-- ============================ MACRO LIST HELPERS ============================
+local macroDD={}
+local function refreshMacroDD()
+    for _,d in ipairs(macroDD) do d.Refresh() end
+end
+local function pickMacro(v)
+    Cfg.sel=v
+    set("sel",v)
+    refreshMacroDD()
+end
+
+local syncSwatches,applyAFK
+
+-- ============================ MAIN TAB ============================
+do
+local pMain=Page("Main")
+local cStats=Card(pMain,"Statistics")
+X.tiles=Tiles(cStats,{"Placed","Upgraded","Sold"})
+
+local cAuto=Card(pMain,"Automation")
+local sumT={}
+local function sumOff(except)
+    for _,k in ipairs({"s1","s10","s25"}) do
+        if k~=except and sumT[k] and sumT[k].GetValue() then
+            sumT[k].SetValue(false)
+            set(k,false)
+        end
+    end
+end
+sumT.s10=Toggle(cAuto,"Auto Summon x10","Summon 10 units per second",Cfg.s10,function(on)
+    set("s10",on)
+    if on then sumOff("s10") end
+end)
+sumT.s1=Toggle(cAuto,"Auto Summon x1","Summon 1 unit per second",Cfg.s1,function(on)
+    set("s1",on)
+    if on then sumOff("s1") end
+end)
+sumT.s25=Toggle(cAuto,"Auto Summon x25","Summon 25 units every 0.5 seconds",Cfg.s25,function(on)
+    set("s25",on)
+    if on then sumOff("s25") end
+end)
+Toggle(cAuto,"Auto Spin","Spin the wheel automatically",Cfg.spn,function(on) set("spn",on) end)
+Toggle(cAuto,"Auto Open Crate","Open the selected crate",Cfg.oc,function(on) set("oc",on) end)
+Dropdown(cAuto,"Crate",function() return {"Free","ScientistCrate","PartyCrate"} end,function() return Cfg.crate end,function(v)
+    set("crate",v)
+    N("Crate: "..v)
+end)
+X.afToggle=Toggle(cAuto,"Auto Fish","Automatic fishing cycle",Cfg.af,function(on)
+    set("af",on)
+    if on then startAutoFish() else stopAutoFish() end
+end)
+
+local cFish=Card(pMain,"Fishing Spot")
+local function fpText()
+    local p=Cfg.fpos
+    if type(p)=="table" and tonumber(p[1]) and tonumber(p[2]) and tonumber(p[3]) then
+        return string.format("Saved spot: %.1f, %.1f, %.1f",p[1],p[2],p[3])
+    end
+    return "No spot picked - Auto Fish will cast in front of the character"
+end
+X.fpLbl=Note(cFish,fpText(),K.sb)
+Note(cFish,"Press the pick button, then cast once in-game at the spot you want. The script saves it for you.")
+function X.stopPick()
+    St.pick=false
+    pcall(function() if X.pickBtn then X.pickBtn.Text="Pick fishing spot" end end)
+end
+function X.onCastPicked(p)
+    St.pick=false
+    Cfg.fpos={p.X,p.Y,p.Z}
+    set("fpos",Cfg.fpos)
+    pcall(function()
+        X.fpLbl.Text=fpText()
+        X.pickBtn.Text="Pick fishing spot"
+    end)
+    N("Fishing spot saved","ok")
+end
+X.pickBtn=Button(cFish,"Pick fishing spot","p",function(b)
+    if St.pick then X.stopPick() N("Selection cancelled","warn") return end
+    St.pick=true
+    b.Text="Cancel (waiting for you to fish in-game...)"
+    N("Go cast in-game at the spot you want and the script will save it","ok")
+    if not HOOK_OK then
+        -- no hook API: use the next world click as the cast spot
+        local conn
+        conn=UIS.InputBegan:Connect(function(inp,gp)
+            if gp then return end
+            local ut=inp.UserInputType
+            if ut==Enum.UserInputType.MouseButton1 or ut==Enum.UserInputType.Touch then
+                conn:Disconnect()
+                if not St.pick then return end
+                local ok,pos=pcall(function() return PLR:GetMouse().Hit.Position end)
+                if ok and pos then X.onCastPicked(pos) else X.stopPick() end
+            end
+        end)
+        ac(conn)
+    end
+end)
+Button(cFish,"Clear saved spot","d",function()
+    set("fpos",false)
+    pcall(function() X.fpLbl.Text=fpText() end)
+    N("Fishing spot cleared","warn")
+end)
+
+local cTp=Card(pMain,"Teleport")
+Note(cTp,"Fishing spot  (-6831, 26, 1044)")
+Button(cTp,"Teleport to Fishing Spot","p",function()
+    local ok=pcall(function()
+        local ch=PLR.Character or PLR.CharacterAdded:Wait()
+        local root=ch:WaitForChild("HumanoidRootPart",5)
+        root.CFrame=CFrame.new(-6831,26,1044)
+    end)
+    N(ok and "Teleported" or "Teleport failed",ok and "ok" or "bad")
+end)
+
+end
+do
+-- ============================ PLAY TAB ============================
+local pPlay=Page("Play")
+local cSpeed=Card(pPlay,"Game Speed")
+Dropdown(cSpeed,"Speed",function() return {"1","1.50","2"} end,function() return Cfg.gs end,function(v)
+    set("gs",v)
+    local n=tonumber(v)
+    local g=ens("g","RemoteEvents","SetGameSpeed")
+    if n and g then pcall(function() g:FireServer(n) end) end
+end)
+local cTog=Card(pPlay,"Round Automation")
+Toggle(cTog,"Auto Skip Wave","Skip waves automatically",Cfg.sk,function(on)
+    set("sk",on)
+    if on then lastW=nil setVis(true) else setVis(false) end
+end)
+Toggle(cTog,"Auto Replay","Vote replay when the round ends",Cfg.rp,function(on)
+    set("rp",on)
+    if on then startRP() else rpL=false end
+end)
+Toggle(cTog,"Auto Lobby","Return to lobby automatically",Cfg.lb,function(on)
+    set("lb",on)
+    if on then startLB() else lbLoop=false end
+end)
+
+-- ---- Map select + auto start ----
+local MAPS={"City","Canyon","WildDesert","Camera Lab","ToiletBunker","Endless Mode"}
+local MODES={"Easy","Medium","Hard","Insane","Crazy"}
+local MODE_KEY={Easy="Eazy",Medium="Medium",Hard="Hard",Insane="Insane",Crazy="Crazy"} -- the game spells it "Eazy"
+local function getJoinQueue()
+    local ok,r=pcall(function()
+        return RS.Packages._Index["sleitnick_knit@1.7.0"].knit.Services.MatchmakingService.RF.JoinQueue
+    end)
+    if ok and typeof(r)=="Instance" and r:IsA("RemoteFunction") then return r end
+end
+local function getVoteRemote()
+    local f=RS:FindFirstChild("ModeVote")
+    local r=f and f:FindFirstChild("Vote")
+    if r and r:IsA("RemoteEvent") then return r end
+end
+local function joinMap(name,silent)
+    local rf=getJoinQueue()
+    if not rf then
+        if not silent then N("JoinQueue remote not found","bad") end
+        return false
+    end
+    task.spawn(function() pcall(function() rf:InvokeServer(name,1) end) end)
+    if not silent then N("Joining queue: "..name,"ok") end
+    return true
+end
+local function voteMode(mode,silent)
+    local rv=getVoteRemote()
+    if not rv then
+        if not silent then N("Vote remote not found","bad") end
+        return false
+    end
+    pcall(function() rv:FireServer(MODE_KEY[mode] or mode) end)
+    if not silent then N("Voted: "..mode,"ok") end
+    return true
+end
+
+local qLoop,vLoop=false,false
+function X.startQ()
+    if St.shut or qLoop then return end
+    qLoop=true
+    task.spawn(function()
+        local last=0
+        while not St.shut and Cfg.qauto do
+            local busy=false
+            pcall(function()
+                if RS:FindFirstChild("WaveState") and roundActive() then busy=true end
+            end)
+            if not busy and Cfg.qmap~="" and tick()-last>=5 then
+                last=tick()
+                joinMap(Cfg.qmap,true)
+            end
+            task.wait(0.5)
+        end
+        qLoop=false
+    end)
+end
+function X.startV()
+    if St.shut or vLoop then return end
+    vLoop=true
+    task.spawn(function()
+        while not St.shut and Cfg.vauto do
+            if Cfg.vmode~="" then voteMode(Cfg.vmode,true) end
+            task.wait(2)
+        end
+        vLoop=false
+    end)
+end
+
+local cMap=Card(pPlay,"Map Select")
+Dropdown(cMap,"Map",function() return MAPS end,function() return Cfg.qmap end,function(v) set("qmap",v) end)
+Button(cMap,"Start Map","p",function()
+    if Cfg.qmap=="" then N("Select a map first","warn") return end
+    joinMap(Cfg.qmap)
+end)
+Toggle(cMap,"Auto Start Map","Join the selected map automatically",Cfg.qauto,function(on)
+    set("qauto",on)
+    if on then
+        if Cfg.qmap=="" then N("Select a map first","warn") end
+        X.startQ()
+    end
+end)
+
+-- ---- Mode vote + auto vote ----
+local cVote=Card(pPlay,"Mode Vote")
+Dropdown(cVote,"Vote mode",function() return MODES end,function() return Cfg.vmode end,function(v) set("vmode",v) end)
+Button(cVote,"Vote Now","p",function()
+    if Cfg.vmode=="" then N("Select a mode first","warn") return end
+    voteMode(Cfg.vmode)
+end)
+Toggle(cVote,"Auto Vote","Vote the selected mode automatically",Cfg.vauto,function(on)
+    set("vauto",on)
+    if on then
+        if Cfg.vmode=="" then N("Select a mode first","warn") end
+        X.startV()
+    end
+end)
+
+end
+do
+-- ============================ MACRO TAB ============================
+local pMacro=Page("Macro")
+
+local cSt=Card(pMacro,"Status")
+do
+    local row=mk("Frame",{Size=UDim2.new(1,0,0,52),BackgroundColor3=K.el,BorderSizePixel=0,LayoutOrder=nxt(cSt)},cSt.f)
+    corner(row,10)
+    stroke(row,K.line,1,0.55)
+    X.sDot=mk("Frame",{Size=UDim2.fromOffset(10,10),Position=UDim2.fromOffset(14,12),BackgroundColor3=K.mt,BorderSizePixel=0},row)
+    corner(X.sDot,5)
+    X.sTxt=T(row,"Idle",14,K.tx,Enum.Font.GothamBold,{Position=UDim2.fromOffset(32,6),Size=UDim2.new(0.5,-32,0,20)})
+    X.sCnt=T(row,"0 actions",11,K.sb,Enum.Font.GothamMedium,{Position=UDim2.new(0.5,0,0,6),Size=UDim2.new(0.5,-14,0,20),TextXAlignment=Enum.TextXAlignment.Right})
+    X.sDet=T(row,"Ready",10,K.sb,Enum.Font.Gotham,{Position=UDim2.fromOffset(32,29),Size=UDim2.new(1,-46,0,16),TextTruncate=Enum.TextTruncate.AtEnd})
+    -- live step panel: only visible while a macro is playing
+    X.stRow=mk("Frame",{Size=UDim2.new(1,0,0,76),BackgroundColor3=K.el,BorderSizePixel=0,Visible=false,LayoutOrder=nxt(cSt)},cSt.f)
+    corner(X.stRow,10)
+    stroke(X.stRow,K.line,1,0.55)
+    local TR=Enum.TextTruncate.AtEnd
+    X.stH=T(X.stRow,"",10,K.mt,Enum.Font.GothamMedium,{Position=UDim2.fromOffset(14,6),Size=UDim2.new(1,-28,0,14),TextTruncate=TR})
+    X.stA=T(X.stRow,"-",13,K.tx,Enum.Font.GothamBold,{Position=UDim2.fromOffset(14,21),Size=UDim2.new(1,-28,0,20),TextTruncate=TR})
+    X.stB=T(X.stRow,"-",11,K.warn,Enum.Font.GothamMedium,{Position=UDim2.fromOffset(14,41),Size=UDim2.new(1,-28,0,16),TextTruncate=TR})
+    X.stC=T(X.stRow,"",10,K.sb,Enum.Font.Gotham,{Position=UDim2.fromOffset(14,58),Size=UDim2.new(1,-28,0,14),TextTruncate=TR})
+end
+
+local cSel=Card(pMacro,"Macro")
+macroDD[#macroDD+1]=Dropdown(cSel,"Selected macro",lf,function() return Cfg.sel end,pickMacro)
+local nameBox=Input(cSel,"New macro name  e.g. EasyFarm",Cfg.mn or "",36)
+ac(nameBox.FocusLost:Connect(function() set("mn",nameBox.Text or "") end))
+Button(cSel,"Create Macro","p",function()
+    local n=nameBox.Text or ""
+    n=(n:gsub('[\\/:%*%?"<>|]','')):match("^%s*(.-)%s*$") or ""
+    if n=="" then N("Enter a macro name","warn") return end
+    pcall(function()
+        if type(isfile)~="function" or not isfile(FO..n..".json") then wj(FO..n..".json",{}) end
+    end)
+    pickMacro(n)
+    N("Macro ready: "..n,"ok")
+end)
+Button(cSel,"Delete Selected Macro","d",function()
+    if Cfg.sel=="" then N("Select a macro first","warn") return end
+    pcall(function() if type(delfile)=="function" then delfile(FO..Cfg.sel..".json") end end)
+    N("Deleted "..Cfg.sel)
+    pickMacro("")
+end)
+
+local cCtl=Card(pMacro,"Controls")
+X.rToggle=Toggle(cCtl,"Record Macro","Captures place / upgrade / sell + exact cost",false,function(on)
+    if on then
+        if rec.active then X.rToggle.SetValue(true) return end
+        if rec.finishing then N("Finishing the previous recording...","warn") X.rToggle.SetValue(false) return end
+        if St.playing then N("Stop playback first","warn") X.rToggle.SetValue(false) return end
+        if Cfg.sel=="" then N("Select or create a macro first","warn") X.rToggle.SetValue(false) return end
+        set("rec",true)
+        refreshHR()
+        resetRec()
+        X.setCount(0)
+        rec.hits=0
+        rec.active=true
+        X.setStatus("Recording")
+        if not HOOK_OK then startPassive() end
+        local c=JH.cash()
+        if c then
+            N("Recording -> "..Cfg.sel.."  |  cash "..JH.full(c),"ok")
+        else
+            N("Recording -> "..Cfg.sel.."  |  cash NOT found","warn")
+        end
+    else
+        stopRecording()
+    end
+end)
+X.pToggle=Toggle(cCtl,"Play Macro","Plays in a loop, round after round",Cfg.pl,function(on)
+    if on then
+        if rec.active then N("Stop recording first","warn") X.pToggle.SetValue(false) return end
+        if Cfg.sel=="" then N("Select a macro first","warn") X.pToggle.SetValue(false) return end
+        set("pl",true)
+        startPlayback()
+    else
+        stopPlayback()
+    end
+end)
+
+local cCash=Card(pMacro,"Cash System")
+do
+    local row=mk("Frame",{Size=UDim2.new(1,0,0,56),BackgroundColor3=K.el,BorderSizePixel=0,LayoutOrder=nxt(cCash)},cCash.f)
+    corner(row,10)
+    stroke(row,K.line,1,0.55)
+    X.cashBig=T(row,"--",20,K.ok,Enum.Font.GothamBold,{Position=UDim2.fromOffset(14,6),Size=UDim2.new(1,-28,0,26)})
+    X.cashSrc=T(row,"Source: not detected",10,K.sb,Enum.Font.Gotham,{Position=UDim2.fromOffset(14,34),Size=UDim2.new(1,-28,0,14),TextTruncate=Enum.TextTruncate.AtEnd})
+end
+Toggle(cCash,"Cash Mode","Wait for the exact cost before place / upgrade",Cfg.cm~=false,function(on) set("cm",on) end)
+Toggle(cCash,"Ignore Wave / Time","Buy as soon as the cash is enough",Cfg.nw~=false,function(on) set("nw",on) end)
+Dropdown(cCash,"Cash source",function()
+    local o={"Auto"}
+    for i,c in ipairs(JH.cands) do if i<=10 then o[#o+1]=c.label end end
+    return o
+end,function() return (Cfg.csrc~="" and Cfg.csrc) or "Auto" end,function(v)
+    set("csrc",v=="Auto" and "" or v)
+    JH.detect()
+    JH.lastDetect=tick()
+    N("Source: "..JH.src,JH.get and "ok" or "warn")
+end)
+Button(cCash,"Re-detect Cash","p",function()
+    JH.detect()
+    JH.lastDetect=tick()
+    local c=JH.cash()
+    if c then
+        N("Cash "..JH.full(c).."  ("..JH.src..")"..(JH.approx and " ~approx" or " exact"),JH.approx and "warn" or "ok")
+    else
+        N("Cash not found - timing mode will be used","warn")
+    end
+end)
+Note(cCash,"Exact costs need a numeric source (leaderstats / attribute / value). A GUI text source such as 1.2K is only approximate.")
+
+end
+do
+-- ============================ SHARE TAB ============================
+local CLIP_FN,CLIP_NAME
+local function resolveClipboard()
+    if CLIP_FN then return CLIP_FN,CLIP_NAME end
+    if type(setclipboard)=="function" then CLIP_FN,CLIP_NAME=setclipboard,"setclipboard" return CLIP_FN,CLIP_NAME end
+    if type(toclipboard)=="function" then CLIP_FN,CLIP_NAME=toclipboard,"toclipboard" return CLIP_FN,CLIP_NAME end
+    if type(writeclipboard)=="function" then CLIP_FN,CLIP_NAME=writeclipboard,"writeclipboard" return CLIP_FN,CLIP_NAME end
+    if type(set_clipboard)=="function" then CLIP_FN,CLIP_NAME=set_clipboard,"set_clipboard" return CLIP_FN,CLIP_NAME end
+    if type(getgenv)=="function" then
+        local ok,env=pcall(getgenv)
+        if ok and type(env)=="table" then
+            for _,n in ipairs({"setclipboard","toclipboard","writeclipboard","set_clipboard"}) do
+                if type(env[n])=="function" then CLIP_FN,CLIP_NAME=env[n],"getgenv."..n return CLIP_FN,CLIP_NAME end
+            end
+        end
+    end
+    if type(syn)=="table" then
+        if type(syn.write_clipboard)=="function" then CLIP_FN,CLIP_NAME=syn.write_clipboard,"syn.write_clipboard" return CLIP_FN,CLIP_NAME end
+        if type(syn.setclipboard)=="function" then CLIP_FN,CLIP_NAME=syn.setclipboard,"syn.setclipboard" return CLIP_FN,CLIP_NAME end
+    end
+    if type(Clipboard)=="table" and type(Clipboard.set)=="function" then
+        CLIP_FN,CLIP_NAME=Clipboard.set,"Clipboard.set"
+        return CLIP_FN,CLIP_NAME
+    end
+    return nil
+end
+resolveClipboard()
+
+local pShare=Page("Share")
+local cExp=Card(pShare,"Export")
+macroDD[#macroDD+1]=Dropdown(cExp,"Macro to export",lf,function() return Cfg.sel end,pickMacro)
+Button(cExp,"Copy Macro to Clipboard","p",function()
+    if Cfg.sel=="" then N("Select a macro first","warn") return end
+    local data=loadMacro(Cfg.sel)
+    if not data or #data==0 then N("Macro is empty or invalid","warn") return end
+    local ok,json=pcall(function() return HS:JSONEncode({Name=Cfg.sel,Actions=data}) end)
+    if not ok or type(json)~="string" then N("Failed to build JSON","bad") return end
+    local fn=resolveClipboard()
+    if not fn then N("No clipboard function in this executor","bad") return end
+    local cok,cerr=pcall(fn,json)
+    if not cok then N("Clipboard error: "..tostring(cerr),"bad") return end
+    N("Macro copied ("..#data.." steps)","ok")
+end)
+
+local cImp=Card(pShare,"Import")
+local importBox=Input(cImp,'Paste macro JSON here  {"Name":"...","Actions":[...]}',"",84,true)
+local importName=Input(cImp,"Macro name (optional - taken from JSON)","",36)
+Button(cImp,"Import and Save","p",function()
+    local raw=importBox.Text or ""
+    if #raw<2 then N("Paste the macro JSON first","warn") return end
+    if raw:sub(1,5)=="EZVC:" then raw=raw:sub(6) elseif raw:sub(1,4)=="JET:" then raw=raw:sub(5) end
+    raw=raw:match("^%s*(.-)%s*$") or raw
+    local ok,decoded=pcall(function() return HS:JSONDecode(raw) end)
+    if not ok or type(decoded)~="table" then N("Invalid JSON","bad") return end
+    local actions,nm
+    if type(decoded.Actions)=="table" then actions=decoded.Actions nm=decoded.Name
+    elseif decoded[1]~=nil then actions=decoded end
+    if not actions then N("Invalid macro data","bad") return end
+    local clean={}
+    for _,a in ipairs(actions) do
+        local s=sanitizeAction(a)
+        if s then clean[#clean+1]=s end
+    end
+    if #clean==0 then N("No valid actions found","bad") return end
+    local name=(importName.Text or ""):match("^%s*(.-)%s*$") or ""
+    if name=="" and type(nm)=="string" then name=nm end
+    name=(name:gsub('[\\/:%*%?"<>|]','')):match("^%s*(.-)%s*$") or ""
+    if name=="" then name="Imported_"..tostring(os.time()) end
+    if wj(FO..name..".json",clean) then
+        pickMacro(name)
+        importBox.Text=""
+        importName.Text=""
+        N("Imported "..#clean.." steps -> "..name,"ok")
+    else
+        N("Save failed (writefile unsupported?)","bad")
+    end
+end)
+
+end
+do
+-- ============================ SETTINGS TAB ============================
+local pSet=Page("Settings")
+local cTheme=Card(pSet,"Accent Color")
+local themes={
+    {"Purple",Color3.fromRGB(155,120,255)},{"Red",Color3.fromRGB(240,98,98)},
+    {"Blue",Color3.fromRGB(108,142,255)},{"Green",Color3.fromRGB(86,208,140)},
+    {"Orange",Color3.fromRGB(245,155,64)},{"Pink",Color3.fromRGB(235,125,185)},
+    {"Cyan",Color3.fromRGB(0,205,225)},{"Yellow",Color3.fromRGB(235,205,92)},
+}
+local swatches={}
+local function sameC(a,b) return math.abs(a.R-b.R)<0.01 and math.abs(a.G-b.G)<0.01 and math.abs(a.B-b.B)<0.01 end
+function syncSwatches()
+    for _,s in ipairs(swatches) do
+        tw(s.ring,0.25,{Transparency=sameC(s.c,K.ac) and 0 or 1})
+    end
+end
+do
+    local row=mk("Frame",{Size=UDim2.new(1,0,0,40),BackgroundColor3=K.el,BorderSizePixel=0,LayoutOrder=nxt(cTheme)},cTheme.f)
+    corner(row,10)
+    mk("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,HorizontalAlignment=Enum.HorizontalAlignment.Center,VerticalAlignment=Enum.VerticalAlignment.Center,Padding=UDim.new(0,10),SortOrder=Enum.SortOrder.LayoutOrder},row)
+    for i,t in ipairs(themes) do
+        local b=mk("TextButton",{Size=UDim2.fromOffset(24,24),BackgroundColor3=t[2],BorderSizePixel=0,Text="",AutoButtonColor=false,LayoutOrder=i},row)
+        corner(b,12)
+        local ring=stroke(b,WHITE,2,1)
+        swatches[#swatches+1]={ring=ring,c=t[2]}
+        ac(b.MouseButton1Click:Connect(function()
+            if St.shut then return end
+            applyTheme(t[2])
+            set("acr",math.floor(t[2].R*255+0.5))
+            set("acg",math.floor(t[2].G*255+0.5))
+            set("acb",math.floor(t[2].B*255+0.5))
+            syncSwatches()
+        end))
+    end
+end
+
+local cUi=Card(pSet,"Interface")
+local sizeNames={Small=0.85,Medium=1,Large=1.15}
+Dropdown(cUi,"UI size",function() return {"Small","Medium","Large"} end,function()
+    for n,v in pairs(sizeNames) do if math.abs(v-(tonumber(Cfg.uis) or 1))<0.01 then return n end end
+    return "Medium"
+end,function(v)
+    set("uis",sizeNames[v] or 1)
+    fit()
+    uiScale.Scale=baseScale
+end)
+Note(cUi,"RightShift or the round J button shows / hides the window. Drag the header or the J button to move them.")
+
+local cLang=Card(pSet,"Language")
+local pendLang=(L.lang=="th") and "ไทย" or "English"
+Dropdown(cLang,"Select language",function() return {"ไทย","English"} end,function() return pendLang end,function(v) pendLang=v end)
+Note(cLang,"Select a language, then press Change Language to apply it instantly.")
+Button(cLang,"Change Language","p",function()
+    local code=(pendLang=="ไทย") and "th" or "en"
+    set("lang",code)
+    L.set(code)
+    N("Language changed","ok")
+end)
+
+local cUt=Card(pSet,"Utility")
+local afkConn
+function applyAFK(on)
+    if afkConn then pcall(function() afkConn:Disconnect() end) afkConn=nil end
+    if on and not St.shut then
+        afkConn=PLR.Idled:Connect(function()
+            if St.shut then return end
+            pcall(function()
+                VU:CaptureController()
+                VU:ClickButton2(Vector2.new())
+            end)
+        end)
+    end
+end
+Toggle(cUt,"Anti AFK","Prevents the idle kick",Cfg.afk,function(on)
+    set("afk",on)
+    applyAFK(on)
+end)
+
+-- ============================ AUTO RECONNECT ============================
+-- Rejoins the map below whenever the client is disconnected or kicked (error prompt / error message).
+local RECONNECT_PLACE_ID=99703116573266
+local arcBusy=false
+local arcConns={}
+local function arcClear()
+    for _,c in ipairs(arcConns) do pcall(function() c:Disconnect() end) end
+    arcConns={}
+end
+local function tryRejoin(force)
+    if St.shut or arcBusy then return end
+    if not force and not Cfg.arc then return end
+    arcBusy=true
+    pcall(function() N("Disconnected - reconnecting...","warn") end)
+    task.spawn(function()
+        local TPS=game:GetService("TeleportService")
+        -- optional: re-run the hub in the new server if the executor supports queue_on_teleport
+        pcall(function()
+            local q=queue_on_teleport or (syn and syn.queue_on_teleport) or (fluxus and fluxus.queue_on_teleport)
+            local boot=getgenv and getgenv().JetHubBoot
+            if q and type(boot)=="string" and boot~="" then q(boot) end
+        end)
+        local tries=0
+        while not St.shut and (force or Cfg.arc) and tries<60 do
+            tries=tries+1
+            pcall(function() TPS:Teleport(RECONNECT_PLACE_ID,PLR) end)
+            task.wait(12)
+        end
+        arcBusy=false
+    end)
+end
+function armReconnect()
+    arcClear()
+    if St.shut or not Cfg.arc then return end
+    local GS=game:GetService("GuiService")
+    arcConns[#arcConns+1]=ac(GS.ErrorMessageChanged:Connect(function(msg)
+        if msg and msg~="" then tryRejoin(false) end
+    end))
+    task.spawn(function()
+        local ok,overlay=pcall(function()
+            local cg=game:GetService("CoreGui")
+            local gui=cg:WaitForChild("RobloxPromptGui",10)
+            return gui and gui:WaitForChild("promptOverlay",10)
+        end)
+        if not ok or not overlay or St.shut then return end
+        arcConns[#arcConns+1]=ac(overlay.ChildAdded:Connect(function(ch)
+            if ch.Name=="ErrorPrompt" then tryRejoin(false) end
+        end))
+        if overlay:FindFirstChild("ErrorPrompt") then tryRejoin(false) end
+    end)
+end
+Toggle(cUt,"Auto Reconnect","Rejoin the map automatically after a disconnect or kick",Cfg.arc,function(on)
+    set("arc",on)
+    armReconnect()
+end)
+Button(cUt,"Reconnect Now","p",function()
+    arcBusy=false
+    N("Reconnecting...","warn")
+    tryRejoin(true)
+end)
+Button(cUt,"Unload "..HUB_FULL,"d",askClose)
+
+end
+
+-- ============================ LIVE CASH DISPLAY ============================
+task.spawn(function()
+    while not St.shut do
+        pcall(function()
+            local c=JH.cash()
+            X.hdrCash.Text="$ "..(c and JH.fmt(c) or "--")
+            X.cashBig.Text=c and ("$ "..JH.full(c)) or "--"
+            X.cashSrc.Text="Source: "..JH.src..(JH.get and (JH.approx and "  (approximate)" or "  (exact)") or "")
+            X.cashSrc.TextColor3=(JH.get and not JH.approx) and K.ok or K.sb
+        end)
+        task.wait(0.4)
+    end
+end)
+
+-- ============================ INIT / RESUME ============================
+applyTheme(K.ac,true)
+syncSwatches()
+_init=false
+go("Main")
+L.apply()
+X.rfC()
+showWin(true)
+task.spawn(function()
+    task.wait(1.5)
+    if St.shut then return end
+    applyTheme(K.ac,true)
+    syncSwatches()
+    JH.detect()
+    JH.lastDetect=tick()
+    local gs=tonumber(Cfg.gs)
+    if gs then
+        local g=ens("g","RemoteEvents","SetGameSpeed")
+        if g then pcall(function() g:FireServer(gs) end) end
+    end
+    if Cfg.sk then lastW=nil setVis(true) end
+    if Cfg.rp then startRP() end
+    if Cfg.lb then startLB() end
+    if Cfg.afk then applyAFK(true) end
+    armReconnect()
+    if Cfg.qauto and X.startQ then X.startQ() end
+    if Cfg.vauto and X.startV then X.startV() end
+    if Cfg.af then startAutoFish() end
+    if Cfg.rec and Cfg.sel~="" then
+        refreshHR()
+        resetRec()
+        X.setCount(0)
+        rec.hits=0
+        rec.active=true
+        X.setStatus("Recording")
+        if not HOOK_OK then startPassive() end
+        X.rToggle.SetValue(true)
+    elseif Cfg.rec then
+        Cfg.rec=false
+        save()
+    end
+    if Cfg.pl and Cfg.sel~="" and not rec.active then
+        local d=loadMacro(Cfg.sel)
+        if d and #d>0 then
+            X.pToggle.SetValue(true)
+            startPlayback()
+            N("Resumed play -> "..Cfg.sel,"ok")
+        else
+            Cfg.pl=false
+            save()
+            X.pToggle.SetValue(false)
+        end
+    else
+        Cfg.pl=false
+        save()
+        X.pToggle.SetValue(false)
+    end
+    local c=JH.cash()
+    if c then
+        N("Ready  |  cash "..JH.full(c).." ("..JH.src..")","ok")
+    else
+        N("Ready  |  cash source not found yet","warn")
+    end
+end)
+print("[JET HUB] loaded - "..HUB_FULL)
