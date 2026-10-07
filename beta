@@ -551,12 +551,9 @@ pad(chip,7,0,7,0)
 local chipT=mk("TextLabel",{AutomaticSize=Enum.AutomaticSize.X,Size=UDim2.new(0,0,1,0),BackgroundTransparency=1,Text=HUB_TAG,Font=Enum.Font.GothamBold,TextSize=9},chip)
 th(chipT,"TextColor3")
 
-local rbox=mk("Frame",{AnchorPoint=Vector2.new(1,0.5),Position=UDim2.new(1,-10,0.5,0),Size=UDim2.fromOffset(210,28),BackgroundTransparency=1},hdr)
+local rbox=mk("Frame",{AnchorPoint=Vector2.new(1,0.5),Position=UDim2.new(1,-10,0.5,0),Size=UDim2.fromOffset(70,28),BackgroundTransparency=1},hdr)
 mk("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,HorizontalAlignment=Enum.HorizontalAlignment.Right,VerticalAlignment=Enum.VerticalAlignment.Center,Padding=UDim.new(0,6),SortOrder=Enum.SortOrder.LayoutOrder},rbox)
-local cashChip=mk("Frame",{Size=UDim2.fromOffset(104,24),BackgroundColor3=K.el,BorderSizePixel=0,LayoutOrder=1},rbox)
-corner(cashChip,8)
-stroke(cashChip,K.line,1,0.4)
-X.hdrCash=T(cashChip,"$ --",11,K.ok,Enum.Font.GothamBold,{Size=UDim2.fromScale(1,1),TextXAlignment=Enum.TextXAlignment.Center})
+X.hdrCash=Instance.new("TextLabel")   -- detached on purpose: header cash pill was removed
 local function hdrBtn(txt,order,hov)
     local b=mk("TextButton",{Size=UDim2.fromOffset(28,28),BackgroundColor3=K.el,BorderSizePixel=0,Font=Enum.Font.GothamBold,TextSize=14,TextColor3=K.sb,Text=txt,AutoButtonColor=false,LayoutOrder=order},rbox)
     corner(b,8)
@@ -616,15 +613,40 @@ for i,n in ipairs(tabNames) do
     ac(b.MouseEnter:Connect(function() if cur~=n then tw(b,0.15,{TextColor3=K.tx}) end end))
     ac(b.MouseLeave:Connect(function() if cur~=n then tw(b,0.15,{TextColor3=K.sb}) end end))
 end
--- player chip
-local pc=mk("Frame",{Size=UDim2.new(1,-16,0,40),Position=UDim2.new(0,8,1,-48),BackgroundColor3=K.el,BorderSizePixel=0},side)
-corner(pc,10)
-local av=mk("Frame",{Size=UDim2.fromOffset(26,26),Position=UDim2.fromOffset(7,7),BorderSizePixel=0},pc)
-corner(av,13)
-th(av,"BackgroundColor3")
-T(av,string.upper(string.sub(PLR.DisplayName,1,1)),12,WHITE,Enum.Font.GothamBold,{Size=UDim2.fromScale(1,1),TextXAlignment=Enum.TextXAlignment.Center})
-T(pc,PLR.DisplayName,11,K.tx,Enum.Font.GothamMedium,{Position=UDim2.fromOffset(40,5),Size=UDim2.new(1,-46,0,15),TextTruncate=Enum.TextTruncate.AtEnd})
-T(pc,"@"..PLR.Name,9,K.mt,Enum.Font.Gotham,{Position=UDim2.fromOffset(40,20),Size=UDim2.new(1,-46,0,13),TextTruncate=Enum.TextTruncate.AtEnd})
+-- player profile card (real Roblox avatar + name + @username)
+local pc=mk("Frame",{Size=UDim2.new(1,-16,0,54),Position=UDim2.new(0,8,1,-62),BackgroundColor3=K.el,BorderSizePixel=0},side)
+corner(pc,13)
+local pcStroke=stroke(pc,K.line,1,0.35)
+mk("UIGradient",{Rotation=90,Transparency=NumberSequence.new({NumberSequenceKeypoint.new(0,0),NumberSequenceKeypoint.new(1,0.35)})},pc)
+-- accent glow strip on the left edge
+local pcBar=mk("Frame",{Size=UDim2.fromOffset(3,24),Position=UDim2.new(0,0,0.5,-12),BorderSizePixel=0},pc)
+corner(pcBar,2)
+th(pcBar,"BackgroundColor3")
+-- avatar with accent ring
+local avRing=mk("Frame",{Size=UDim2.fromOffset(40,40),Position=UDim2.fromOffset(9,7),BackgroundColor3=K.bg,BorderSizePixel=0},pc)
+corner(avRing,20)
+local avRingSt=stroke(avRing,K.ac,2,0.05)
+th(avRingSt,"Color")
+local avLetter=T(avRing,string.upper(string.sub(PLR.DisplayName,1,1)),15,K.tx,Enum.Font.GothamBold,{Size=UDim2.fromScale(1,1),TextXAlignment=Enum.TextXAlignment.Center})
+local avImg=mk("ImageLabel",{Size=UDim2.new(1,-4,1,-4),Position=UDim2.fromOffset(2,2),BackgroundTransparency=1,Image="",ScaleType=Enum.ScaleType.Crop},avRing)
+corner(avImg,18)
+task.spawn(function()
+    local ok,img=pcall(function()
+        return game:GetService("Players"):GetUserThumbnailAsync(PLR.UserId,Enum.ThumbnailType.HeadShot,Enum.ThumbnailSize.Size100x100)
+    end)
+    if ok and type(img)=="string" and img~="" and not St.shut and avImg.Parent then
+        avImg.Image=img
+        avLetter.Visible=false
+    end
+end)
+-- online dot
+local avDot=mk("Frame",{Size=UDim2.fromOffset(11,11),Position=UDim2.new(1,-9,1,-9),BackgroundColor3=K.ok,BorderSizePixel=0},avRing)
+corner(avDot,6)
+stroke(avDot,K.el,2,0)
+T(pc,PLR.DisplayName,12,K.tx,Enum.Font.GothamBold,{Position=UDim2.fromOffset(56,9),Size=UDim2.new(1,-62,0,16),TextTruncate=Enum.TextTruncate.AtEnd})
+T(pc,"@"..PLR.Name,9,K.mt,Enum.Font.Gotham,{Position=UDim2.fromOffset(56,27),Size=UDim2.new(1,-62,0,13),TextTruncate=Enum.TextTruncate.AtEnd})
+ac(pc.MouseEnter:Connect(function() tw(pcStroke,0.18,{Color=K.ac,Transparency=0.1}) end))
+ac(pc.MouseLeave:Connect(function() tw(pcStroke,0.18,{Color=K.line,Transparency=0.35}) end))
 
 -- ============================ COMPONENTS ============================
 local function nxt(o) o.n=o.n+1 return o.n end
