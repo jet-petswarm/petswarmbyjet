@@ -304,7 +304,10 @@ do
         {"Select a language, then press Change Language to apply it instantly.","เลือกภาษา แล้วกดปุ่มเปลี่ยนภาษา ระบบจะเปลี่ยนให้ทันที"},
         {"Select language","เลือกภาษา"},{"Change Language","เปลี่ยนภาษา"},{"Language changed","เปลี่ยนภาษาแล้ว"},
         {"Select...","เลือก..."},{"Nothing to select","ไม่มีให้เลือก"},
-        {"Idle","ว่าง"},{"Auto Reconnect","ออโต้เชื่อมต่อใหม่"},{"Rejoin the map automatically after a disconnect or kick","เข้าแมพใหม่อัตโนมัติเมื่อหลุดหรือโดนเตะ"},{"Reconnect Now","เชื่อมต่อใหม่ทันที"},{"Disconnected - reconnecting...","หลุดการเชื่อมต่อ - กำลังเชื่อมต่อใหม่..."},{"Reconnecting...","กำลังเชื่อมต่อใหม่..."},{"Sold OK","ขายแล้ว"},{"Recording","กำลังบันทึก"},{"Playing","กำลังเล่น"},{"Ready","พร้อม"},
+        {"Idle","ว่าง"},{"Cost Editor","ตัวแก้ราคา"},{"Unit","ยูนิต"},{"Select","เลือก"},{"Place cost","ราคาวาง"},{"Locked","ล็อค"},{"Auto","อัตโนมัติ"},{"Unlock all","ปลดล็อคทั้งหมด"},
+        {"Pick a unit, press Select, then type a price. Typed prices are saved to the macro automatically and locked - the script never changes them. Clear a box to unlock it.","เลือกยูนิต กดเลือก แล้วพิมพ์ราคา ราคาที่พิมพ์จะถูกบันทึกลงมาโครอัตโนมัติและล็อคไว้ สคริปต์จะไม่แก้ให้ ลบช่องออกเพื่อปลดล็อค"},
+        {"Cost saved and locked","บันทึกราคาและล็อคแล้ว"},{"Cost unlocked - will auto learn","ปลดล็อคราคาแล้ว - จะเรียนรู้ใหม่เอง"},{"Enter a valid number","ใส่ตัวเลขที่ถูกต้อง"},
+        {"Select a unit first","เลือกยูนิตก่อน"},{"Unit not found in this macro","ไม่พบยูนิตนี้ในมาโคร"},{"All prices unlocked","ปลดล็อคทุกราคาแล้ว"},{"Applies from the next round","มีผลตั้งแต่รอบถัดไป"},{"Auto Reconnect","ออโต้เชื่อมต่อใหม่"},{"Rejoin the map automatically after a disconnect or kick","เข้าแมพใหม่อัตโนมัติเมื่อหลุดหรือโดนเตะ"},{"Reconnect Now","เชื่อมต่อใหม่ทันที"},{"Disconnected - reconnecting...","หลุดการเชื่อมต่อ - กำลังเชื่อมต่อใหม่..."},{"Reconnecting...","กำลังเชื่อมต่อใหม่..."},{"Sold OK","ขายแล้ว"},{"Recording","กำลังบันทึก"},{"Playing","กำลังเล่น"},{"Ready","พร้อม"},
         {"Starting...","กำลังเริ่ม..."},{"Measuring exact costs...","กำลังวัดราคาจริง..."},
         {"Capturing actions + exact costs","กำลังบันทึกการกระทำ + ราคาจริง"},{"Running macro","กำลังรันมาโคร"},
         {"Waiting for the round to start...","รอรอบเริ่ม..."},{"Waiting for round","รอรอบเริ่ม"},
@@ -360,6 +363,8 @@ do
         {"^Round (%d+) | (.*)$","^รอบ (%d+) | (.*)$","Round %s | %s","รอบ %s | %s"},
         {"^Next  (.*)$","^ถัดไป  (.*)$","Next  %s","ถัดไป  %s"},
         {"^Fixed macro cost at step (%d+): (.-) %->  ?(.-)$","^แก้ราคาในมาโคร ขั้น (%d+): (.-) →  ?(.-)$","Fixed macro cost at step %s: %s -> %s","แก้ราคาในมาโคร ขั้น %s: %s → %s"},
+        {"^Upgrade (%d+)$","^อัพเกรด (%d+)$","Upgrade %s","อัพเกรด %s"},
+        {"^(.-): (%d+) placed, up to (%d+) upgrade steps$","^(.-): วางแล้ว (%d+) ตัว สูงสุด (%d+) ขั้นอัพเกรด$","%s: %s placed, up to %s upgrade steps","%s: วางแล้ว %s ตัว สูงสุด %s ขั้นอัพเกรด"},
         {"^(%d+): (.*)$","^(%d+): (.*)$","%s: %s","%s: %s"},
     }
     local TH,EN={},{}
@@ -1624,11 +1629,19 @@ local function startPlayback()
         -- write the corrected price straight back into the macro file
         local function fixCost(ctx,idx,a,real)
             real=math.floor((tonumber(real) or 0)+0.5)
-            if real<=0 or a.c==real then return end
+            if real<=0 or a.c==real or a.l then return end   -- a.l = locked by the user (Cost Editor)
             local old=a.c
             a.c=real
             JH.learned[Cfg.sel..":"..idx]=real
-            wj(FO..Cfg.sel..".json",ctx.data)
+            -- merge into the latest file so edits made in the Cost Editor during a round are not overwritten
+            local fresh=loadMacro(Cfg.sel)
+            if fresh and #fresh==#ctx.data and fresh[idx] and fresh[idx].t==a.t then
+                if fresh[idx].l then a.c=fresh[idx].c a.l=true return end
+                fresh[idx].c=real
+                wj(FO..Cfg.sel..".json",fresh)
+            else
+                wj(FO..Cfg.sel..".json",ctx.data)
+            end
             N(string.format("Fixed macro cost at step %d: %s -> %s",idx,old and JH.full(old) or "?",JH.full(real)),"ok")
         end
         local function afterBuy(ctx,idx,a,sp,need,corrected)
@@ -1642,7 +1655,7 @@ local function startPlayback()
             if not PL then N("PlaceTower remote not found","bad") return end
             local cf=CFrame.new(a.p[1],a.p[2],a.p[3])
             local key=Cfg.sel..":"..idx
-            local need=useCash and (JH.learned[key] or a.c or 0) or 0
+            local need=useCash and ((a.l and a.c) or JH.learned[key] or a.c or 0) or 0
             local lim=(a.c and a.c>0) and a.c*3 or math.huge
             local tries,placed,hard,corrected=0,false,0,false
             local maxTry=useCash and 400 or 15
@@ -1686,10 +1699,14 @@ local function startPlayback()
                         end
                         -- bought nothing although we thought the cash was enough:
                         -- the real price is higher -> raise it by a tiny step and retry fast
-                        need=math.max(need,c)+stepFor(math.max(need,c,1))
-                        corrected=true
-                        if need>lim then break end
-                        task.wait()
+                        if a.l then
+                            task.wait(0.4)      -- price is locked by the user: never raise it, keep waiting for the real price
+                        else
+                            need=math.max(need,c)+stepFor(math.max(need,c,1))
+                            corrected=true
+                            if need>lim then break end
+                            task.wait()
+                        end
                     else
                         task.wait(0.3)
                     end
@@ -1711,7 +1728,7 @@ local function startPlayback()
                 return
             end
             local key=Cfg.sel..":"..idx
-            local need=useCash and (JH.learned[key] or a.c or 0) or 0
+            local need=useCash and ((a.l and a.c) or JH.learned[key] or a.c or 0) or 0
             local lim=(a.c and a.c>0) and a.c*3 or math.huge
             local tries,done,hard,corrected=0,false,0,false
             local deadline=tick()+180
@@ -1746,10 +1763,14 @@ local function startPlayback()
                             hard=hard+1
                             if hard>=4 then break end
                         end
-                        need=math.max(need,c)+stepFor(math.max(need,c,1))
-                        corrected=true
-                        if need>lim then break end
-                        task.wait()
+                        if a.l then
+                            task.wait(0.4)
+                        else
+                            need=math.max(need,c)+stepFor(math.max(need,c,1))
+                            corrected=true
+                            if need>lim then break end
+                            task.wait()
+                        end
                     else
                         task.wait(0.25)
                     end
@@ -2042,6 +2063,7 @@ local function pickMacro(v)
     Cfg.sel=v
     set("sel",v)
     refreshMacroDD()
+    if X.ceReset then pcall(X.ceReset) end
 end
 
 local syncSwatches,applyAFK
@@ -2315,6 +2337,164 @@ Button(cSel,"Delete Selected Macro","d",function()
     N("Deleted "..Cfg.sel)
     pickMacro("")
 end)
+
+
+-- ============================ COST EDITOR ============================
+-- Pick a unit of the selected macro -> edit its place price and every upgrade step.
+-- Typed prices are written into the macro file and LOCKED (a.l=true): playback never learns / changes them.
+do
+    local ce={unit=nil}
+    local cCE=Card(pMacro,"Cost Editor")
+    Note(cCE,"Pick a unit, press Select, then type a price. Typed prices are saved to the macro automatically and locked - the script never changes them. Clear a box to unlock it.")
+
+    -- all actions that belong to one unit name
+    local function ceIndex(data,unit)
+        local ids,places={},{}
+        for _,a in ipairs(data) do
+            if a.t=="P" and a.n==unit then ids[a.i]=true places[#places+1]=a end
+        end
+        local chains,maxSteps={},0
+        for _,a in ipairs(data) do
+            if a.t=="U" and ids[a.i] then
+                local ch=chains[a.i]
+                if not ch then ch={} chains[a.i]=ch end
+                ch[#ch+1]=a
+                if #ch>maxSteps then maxSteps=#ch end
+            end
+        end
+        return places,chains,maxSteps
+    end
+    local function ceTargets(data,unit,kind,step)
+        local places,chains=ceIndex(data,unit)
+        if kind=="P" then return places end
+        local t={}
+        for _,p in ipairs(places) do
+            local ch=chains[p.i]
+            if ch and ch[step] then t[#t+1]=ch[step] end
+        end
+        return t
+    end
+
+    local unitDD=Dropdown(cCE,"Unit",function()
+        local d=loadMacro(Cfg.sel)
+        local seen,out={},{}
+        if d then
+            for _,a in ipairs(d) do
+                if a.t=="P" and not seen[a.n] then seen[a.n]=true out[#out+1]=a.n end
+            end
+        end
+        table.sort(out,function(x,y) return x:lower()<y:lower() end)
+        return out
+    end,function() return ce.unit end,function(v) ce.unit=v end)
+
+    local build
+    Button(cCE,"Select","p",function() build() end)
+    local box=mk("Frame",{Size=UDim2.new(1,0,0,0),AutomaticSize=Enum.AutomaticSize.Y,BackgroundTransparency=1,LayoutOrder=nxt(cCE)},cCE.f)
+    vlist(box,6)
+    local function clear()
+        for _,ch in ipairs(box:GetChildren()) do
+            if not ch:IsA("UIListLayout") then pcall(function() ch:Destroy() end) end
+        end
+    end
+
+    local function addRow(order,title,unit,kind,step)
+        local data=loadMacro(Cfg.sel) or {}
+        local targets=ceTargets(data,unit,kind,step)
+        local shown
+        for _,t in ipairs(targets) do if t.l then shown=t break end end
+        shown=shown or targets[1]
+        local locked=(shown and shown.l) and true or false
+        local val=shown and tonumber(shown.c) or nil
+
+        local row=mk("Frame",{Size=UDim2.new(1,0,0,42),BackgroundColor3=K.el,BorderSizePixel=0,LayoutOrder=order},box)
+        corner(row,9)
+        stroke(row,K.line,1,0.55)
+        T(row,title,12,K.tx,Enum.Font.GothamMedium,{Position=UDim2.fromOffset(12,5),Size=UDim2.new(1,-150,0,17)})
+        local st=T(row,locked and "Locked" or "Auto",9,locked and K.ok or K.mt,Enum.Font.GothamBold,{Position=UDim2.fromOffset(12,24),Size=UDim2.new(1,-150,0,12)})
+        local bx=mk("Frame",{Size=UDim2.fromOffset(122,28),AnchorPoint=Vector2.new(1,0.5),Position=UDim2.new(1,-8,0.5,0),BackgroundColor3=K.bg,BorderSizePixel=0},row)
+        corner(bx,7)
+        local bs=stroke(bx,K.line,1,0.2)
+        local tb=mk("TextBox",{
+            Size=UDim2.new(1,-14,1,0),Position=UDim2.fromOffset(7,0),BackgroundTransparency=1,
+            Font=Enum.Font.GothamMedium,TextSize=12,TextColor3=K.tx,
+            PlaceholderText=val and JH.full(val) or "auto",PlaceholderColor3=K.mt,
+            Text=(locked and val) and JH.full(val) or "",
+            ClearTextOnFocus=false,TextXAlignment=Enum.TextXAlignment.Right,ClipsDescendants=true
+        },bx)
+        ac(tb.Focused:Connect(function() tw(bs,0.15,{Color=K.ac,Transparency=0}) end))
+        ac(tb.FocusLost:Connect(function()
+            tw(bs,0.15,{Color=K.line,Transparency=0.2})
+            if St.shut then return end
+            local text=(tb.Text or ""):match("^%s*(.-)%s*$") or ""
+            local function restore()
+                tb.Text=(locked and val) and JH.full(val) or ""
+            end
+            if rec.active then N("Stop recording first","warn") restore() return end
+            local fresh=loadMacro(Cfg.sel)
+            if not fresh then N("Macro is empty or invalid","warn") restore() return end
+            local tg=ceTargets(fresh,unit,kind,step)
+            if #tg==0 then restore() return end
+            local num
+            if text~="" then
+                if text:match("^[%d,%.]+%s*%a*$") then num=JH.parse(text) end
+                if not num then N("Enter a valid number","warn") restore() return end
+                num=math.floor(num+0.5)
+            end
+            if text=="" or num<=0 then
+                if not locked then tb.Text="" return end          -- already automatic
+                for _,t in ipairs(tg) do t.l=nil end
+                wj(FO..Cfg.sel..".json",fresh)
+                locked=false
+                tb.Text=""
+                st.Text="Auto" st.TextColor3=K.mt
+                N("Cost unlocked - will auto learn","warn")
+            else
+                for _,t in ipairs(tg) do t.c=num t.l=true end
+                wj(FO..Cfg.sel..".json",fresh)
+                locked=true val=num
+                tb.Text=JH.full(num)
+                st.Text="Locked" st.TextColor3=K.ok
+                N("Cost saved and locked","ok")
+            end
+            if St.playing then N("Applies from the next round","ok") end
+        end))
+    end
+
+    function build()
+        clear()
+        if Cfg.sel=="" then N("Select a macro first","warn") return end
+        local unit=ce.unit
+        if not unit or unit=="" then N("Select a unit first","warn") return end
+        local data=loadMacro(Cfg.sel)
+        if not data or #data==0 then N("Macro is empty or invalid","warn") return end
+        local places,chains,maxSteps=ceIndex(data,unit)
+        if #places==0 then N("Unit not found in this macro","warn") return end
+        T(box,string.format("%s: %d placed, up to %d upgrade steps",unit,#places,maxSteps),10,K.sb,Enum.Font.GothamMedium,{Size=UDim2.new(1,0,0,14),LayoutOrder=0})
+        addRow(1,"Place cost",unit,"P",0)
+        for k=1,maxSteps do addRow(1+k,"Upgrade "..k,unit,"U",k) end
+        local ub=mk("TextButton",{Size=UDim2.new(1,0,0,32),BackgroundColor3=K.el,BorderSizePixel=0,Font=Enum.Font.GothamBold,TextSize=11,TextColor3=K.tx,Text="Unlock all",AutoButtonColor=false,LayoutOrder=maxSteps+5},box)
+        corner(ub,9)
+        stroke(ub,K.line,1,0.4)
+        ac(ub.MouseButton1Click:Connect(function()
+            if St.shut then return end
+            if rec.active then N("Stop recording first","warn") return end
+            local fresh=loadMacro(Cfg.sel)
+            if not fresh then return end
+            local pl,ch=ceIndex(fresh,unit)
+            for _,p in ipairs(pl) do p.l=nil end
+            for _,list in pairs(ch) do for _,u in ipairs(list) do u.l=nil end end
+            wj(FO..Cfg.sel..".json",fresh)
+            N("All prices unlocked","warn")
+            build()
+        end))
+    end
+
+    function X.ceReset()
+        ce.unit=nil
+        pcall(function() unitDD.Refresh() end)
+        clear()
+    end
+end
 
 local cCtl=Card(pMacro,"Controls")
 X.rToggle=Toggle(cCtl,"Record Macro","Captures place / upgrade / sell + exact cost",false,function(on)
