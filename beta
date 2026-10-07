@@ -1,5 +1,5 @@
 --[[
-    JET HUB - BETA
+    JET HUB
     Record / Play macro hub with exact-cash system
     - Cash is read from the real numeric value (leaderstats / attribute / value object)
     - Cost of every place / upgrade is measured from the real cash drop
@@ -20,7 +20,7 @@ local RUN=game:GetService("RunService")
 local PLR=game:GetService("Players").LocalPlayer
 local PG=PLR:FindFirstChild("PlayerGui") or PLR:WaitForChild("PlayerGui")
 
-local HUB_NAME,HUB_TAG,HUB_FULL="JET HUB","BETA","JET HUB - BETA"
+local HUB_NAME,HUB_TAG,HUB_FULL="JET HUB","","JET HUB"
 
 -- global state (kept in one table to stay far away from the local-variable limit)
 local St={shut=false,playing=false,psess=0,fish=false,fsess=0,cur="Idle",visible=true,pick=false}
@@ -544,12 +544,6 @@ T(logo,"J",17,WHITE,Enum.Font.GothamBlack,{Size=UDim2.fromScale(1,1),TextXAlignm
 local tbox=mk("Frame",{Size=UDim2.new(0,200,1,0),Position=UDim2.fromOffset(52,0),BackgroundTransparency=1},hdr)
 mk("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,VerticalAlignment=Enum.VerticalAlignment.Center,Padding=UDim.new(0,8),SortOrder=Enum.SortOrder.LayoutOrder},tbox)
 mk("TextLabel",{AutomaticSize=Enum.AutomaticSize.X,Size=UDim2.new(0,0,0,20),BackgroundTransparency=1,Text=HUB_NAME,Font=Enum.Font.GothamBlack,TextSize=16,TextColor3=K.tx,LayoutOrder=1},tbox)
-local chip=mk("Frame",{AutomaticSize=Enum.AutomaticSize.X,Size=UDim2.fromOffset(0,16),BackgroundTransparency=0.8,BorderSizePixel=0,LayoutOrder=2},tbox)
-corner(chip,5)
-th(chip,"BackgroundColor3")
-pad(chip,7,0,7,0)
-local chipT=mk("TextLabel",{AutomaticSize=Enum.AutomaticSize.X,Size=UDim2.new(0,0,1,0),BackgroundTransparency=1,Text=HUB_TAG,Font=Enum.Font.GothamBold,TextSize=9},chip)
-th(chipT,"TextColor3")
 
 local rbox=mk("Frame",{AnchorPoint=Vector2.new(1,0.5),Position=UDim2.new(1,-10,0.5,0),Size=UDim2.fromOffset(70,28),BackgroundTransparency=1},hdr)
 mk("UIListLayout",{FillDirection=Enum.FillDirection.Horizontal,HorizontalAlignment=Enum.HorizontalAlignment.Right,VerticalAlignment=Enum.VerticalAlignment.Center,Padding=UDim.new(0,6),SortOrder=Enum.SortOrder.LayoutOrder},rbox)
@@ -566,12 +560,12 @@ local xb=hdrBtn("x",3,Color3.fromRGB(200,70,76))
 dragify(hdr,holder)
 
 -- body / sidebar / content / footer
-local FOOT_H=26
+local FOOT_H=0
 local body=mk("Frame",{Size=UDim2.new(1,0,1,-(48+FOOT_H)),Position=UDim2.fromOffset(0,48),BackgroundTransparency=1},win)
 local side=mk("Frame",{Size=UDim2.new(0,132,1,0),BackgroundColor3=K.side,BorderSizePixel=0},body)
 mk("Frame",{Size=UDim2.new(0,1,1,0),Position=UDim2.new(1,-1,0,0),BackgroundColor3=K.line,BackgroundTransparency=0.4,BorderSizePixel=0},side)
 local content=mk("Frame",{Size=UDim2.new(1,-132,1,0),Position=UDim2.fromOffset(132,0),BackgroundTransparency=1,ClipsDescendants=true},body)
-local foot=mk("Frame",{Size=UDim2.new(1,0,0,FOOT_H),Position=UDim2.new(0,0,1,-FOOT_H),BackgroundColor3=K.side,BorderSizePixel=0},win)
+local foot=mk("Frame",{Size=UDim2.new(1,0,0,26),Position=UDim2.new(0,0,1,-26),BackgroundColor3=K.side,BorderSizePixel=0,Visible=false},win)   -- footer removed (hidden)
 mk("Frame",{Size=UDim2.new(1,0,0,1),BackgroundColor3=K.line,BackgroundTransparency=0.4,BorderSizePixel=0},foot)
 local fDot=mk("Frame",{Size=UDim2.fromOffset(6,6),Position=UDim2.new(0,14,0.5,-3),BorderSizePixel=0},foot)
 corner(fDot,3)
